@@ -146,13 +146,15 @@ class TaskRunner:
         if reward_manager_name == 'episode':
             from agent_system.reward_manager import EpisodeRewardManager
             reward_manager_cls = EpisodeRewardManager
+            reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
+            val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
+        elif reward_manager_name == 'rrg':
+            from agent_system.reward_manager.rrg_reward import RRGRewardManager
+            rrg_cfg = OmegaConf.to_container(config.algorithm.rrg, resolve=True)
+            reward_fn = RRGRewardManager(tokenizer=tokenizer, num_examine=0, config=rrg_cfg, envs=envs)
+            val_reward_fn = RRGRewardManager(tokenizer=tokenizer, num_examine=1, config=rrg_cfg, envs=val_envs)
         else:
             raise NotImplementedError
-
-        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
-
-        # Note that we always use function-based RM for validation
-        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

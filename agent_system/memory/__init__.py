@@ -14,3 +14,4 @@
 # limitations under the License.
 
 from .memory import SimpleMemory, SearchMemory
+from .fact_bank import FactBankMemory

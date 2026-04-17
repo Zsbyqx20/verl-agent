@@ -252,6 +252,33 @@ algorithm:
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
+  rrg:
+    # Citation reward weights
+    alpha_prec: 0.4
+    alpha_rec: 0.4
+    alpha_rep: 0.2
+    # Fact quality weights
+    lambda_use: 0.4
+    lambda_val: 0.2
+    lambda_atom: 0.2
+    lambda_gran: 0.2
+    gamma_discount: 0.9
+    update_bonus_scale: 0.5
+    # Advantage combination weights
+    w_cite: 1.0
+    w_write: 1.0
+    w_final: 0.0  # phase 2: trajectory-level J_final
+    # Judge configuration
+    judge_model: "doubao-seed-2-0-pro-260215"
+    judge_base_url: null  # defaults to OPENAI_BASE_URL env var
+    max_retries: 3
+    max_judge_workers: 16
+    # Debug logging
+    debug_log: False
+    debug_log_samples: 3
+    debug_log_file: null  # optional JSONL path for detailed RRG debug events
+    log_judge_errors: True
+    max_judge_error_logs: 20
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10
@@ -314,3 +341,6 @@ env:
   webshop:
     use_small: True
     human_goals: False
+  rrg:
+    trajectory_data_path: null  # path to JSON with pre-recorded trajectories
+    reasoning_history_length: 5  # max prior reasoning steps in prompt

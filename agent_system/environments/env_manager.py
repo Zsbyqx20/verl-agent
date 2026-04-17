@@ -19,9 +19,11 @@ import torch
 import numpy as np
 from functools import partial
 import os
+import json
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
+from agent_system.memory.fact_bank import FactBankMemory
 from omegaconf import OmegaConf
 
 def parse_gamefile(infos):
@@ -599,6 +601,194 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+class RRGEnvironmentManager(EnvironmentManagerBase):
+    """Environment manager for the Reverse Reasoning Generator.
+
+    Wraps an RRGReplayEnv that serves pre-recorded GUI trajectories.
+    Maintains a FactBankMemory across steps and accumulates step metadata
+    for the reward manager.
+    """
+
+    def __init__(self, envs, projection_f, config):
+        self.memory = FactBankMemory()
+        self.reasoning_memory = []  # per-env reasoning history
+        self.step_metadata: dict[str, list[dict]] = {}  # traj_uid -> list of step metas
+        self._current_step = []  # per-env step counter
+        self._tasks = []
+        self._total_steps = []
+        rrg_cfg = config.get("algorithm", {}).get("rrg", {})
+        self._debug_log = bool(rrg_cfg.get("debug_log", False))
+        self._debug_log_samples = int(rrg_cfg.get("debug_log_samples", 3))
+        self._debug_log_file = rrg_cfg.get("debug_log_file", None)
+        super().__init__(envs, projection_f, config)
+
+    def _log_debug(self, event: str, payload: dict):
+        if not self._debug_log:
+            return
+        message = {"event": event, **payload}
+        print(f"[RRG][env] {json.dumps(message, ensure_ascii=False, default=str)}")
+        if self._debug_log_file:
+            with open(self._debug_log_file, "a") as f:
+                f.write(json.dumps({"source": "env", **message}, ensure_ascii=False, default=str) + "\n")
+
+    def reset(self, kwargs):
+        text_obs, image_obs, infos = self.envs.reset()
+        batch_size = len(text_obs)
+        self.memory.reset(batch_size=batch_size)
+        self.reasoning_memory = [[] for _ in range(batch_size)]
+        self._current_step = [0] * batch_size
+        self._tasks = [info.get("task", "") for info in infos]
+        self._total_steps = [info.get("total_steps", 1) for info in infos]
+        self.step_metadata = {}
+
+        full_text_obs = self.build_text_obs(text_obs, infos, init=True)
+
+        # Keep as a list-of-lists; each element is a list of 1 or 2 numpy arrays.
+        image_list = image_obs if image_obs and image_obs[0] is not None else None
+
+        self._log_debug("reset", {
+            "batch_size": batch_size,
+            "sample_tasks": self._tasks[:self._debug_log_samples],
+            "sample_total_steps": self._total_steps[:self._debug_log_samples],
+            "sample_actions": [info.get("ground_truth_action", "") for info in infos[:self._debug_log_samples]],
+        })
+
+        return {"text": full_text_obs, "image": image_list, "anchor": text_obs}, infos
+
+    def step(self, text_actions: List[str]):
+        from rrg.output_parser import parse_rrg_output
+
+        actions, valids = self.projection_f(text_actions)
+        batch_size = len(text_actions)
+
+        # Parse each model output; snapshot bank BEFORE writing new facts.
+        all_updates = []
+        all_reasoning = []
+        all_cited = []
+        all_writing_updates = []
+        obs_before_snapshots = []  # bank state before this step's writes
+        for i in range(batch_size):
+            # Snapshot before update — used by J_fact / J_cite judges
+            obs_before_snapshots.append(list(self.memory.get_bank(i)))
+
+            parse_result = parse_rrg_output(text_actions[i])
+            all_cited.append(parse_result.citation_indices)
+            all_reasoning.append(parse_result.reasoning_text)
+            all_writing_updates.append(parse_result.writing_updates)
+
+            # Update fact bank and reasoning history
+            updates = parse_result.writing_updates
+            all_updates.append(updates)
+            self.memory.apply_updates(i, updates, self._current_step[i])
+            self.reasoning_memory[i].append(parse_result.reasoning_text)
+
+        if self._debug_log:
+            parse_examples = []
+            for i in range(min(batch_size, self._debug_log_samples)):
+                parse_examples.append({
+                    "env_slot": i,
+                    "step_index": self._current_step[i],
+                    "cited_indices": all_cited[i],
+                    "num_writes": len(all_writing_updates[i]),
+                    "reasoning_chars": len(all_reasoning[i]),
+                    "bank_size_before": len(obs_before_snapshots[i]),
+                    "bank_size_after": len(self.memory.get_bank(i)),
+                    "output_prefix": text_actions[i][:300],
+                })
+            self._log_debug("step_parse", {
+                "batch_size": batch_size,
+                "num_outputs_with_citations": sum(1 for cited in all_cited if cited),
+                "num_outputs_with_writes": sum(1 for writes in all_writing_updates if writes),
+                "total_writes": sum(len(writes) for writes in all_writing_updates),
+                "examples": parse_examples,
+            })
+
+        # Step the replay environment
+        text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
+
+        # Accumulate step metadata for reward manager, keyed by env slot index.
+        for i in range(batch_size):
+            key = str(i)
+            if key not in self.step_metadata:
+                self.step_metadata[key] = []
+            self.step_metadata[key].append({
+                "task": self._tasks[i],
+                "step_index": self._current_step[i],
+                "screenshot_path": infos[i].get("screenshot_path", ""),
+                "ground_truth_action": infos[i].get("ground_truth_action", ""),
+                "observations_before": obs_before_snapshots[i],
+                "cited_indices": all_cited[i],
+                "writing_updates": all_writing_updates[i],
+                "model_output": text_actions[i],
+            })
+
+        # Update step counters
+        for i in range(batch_size):
+            self._current_step[i] += 1
+
+        # Add action validity to infos
+        for i, info in enumerate(infos):
+            info["is_action_valid"] = to_numpy(valids[i])
+
+        # Build next observations
+        full_text_obs = self.build_text_obs(text_obs, infos)
+        image_list = image_obs if image_obs and image_obs[0] is not None else None
+
+        next_observations = {"text": full_text_obs, "image": image_list, "anchor": text_obs}
+        rewards = to_numpy(rewards)
+        dones = to_numpy(dones)
+
+        return next_observations, rewards, dones, infos
+
+    def build_text_obs(self, text_obs: List[str], infos: List[dict], init: bool = False) -> List[str]:
+        from agent_system.environments.prompts.rrg import RRG_SYSTEM_PROMPT, RRG_TEMPLATE_INIT, RRG_TEMPLATE, _AFTER_ACTION_SECTION
+
+        postprocess_text_obs = []
+        batch_size = len(text_obs)
+        reasoning_hist_len = self.config.env.get("rrg", {}).get("reasoning_history_length", 5)
+
+        for i in range(batch_size):
+            # For non-terminal steps, use next_ground_truth_action for prompt construction;
+            # for terminal/init steps, fall back to ground_truth_action.
+            info_i = infos[i] if infos else {}
+            action_str = info_i.get("next_ground_truth_action", info_i.get("ground_truth_action", ""))
+            after_action_section = _AFTER_ACTION_SECTION if info_i.get("has_after_image", False) else ""
+
+            if init:
+                obs = RRG_SYSTEM_PROMPT + "\n\n" + RRG_TEMPLATE_INIT.format(
+                    task_description=self._tasks[i],
+                    total_steps=self._total_steps[i],
+                    ground_truth_action=action_str,
+                    after_action_section=after_action_section,
+                )
+            else:
+                obs_bank = self.memory.get_bank_formatted(i)
+                history = self.reasoning_memory[i][-reasoning_hist_len:] if reasoning_hist_len > 0 else []
+                offset = max(0, len(self.reasoning_memory[i]) - len(history))
+                reasoning_hist = "\n".join(f"Step {offset + j + 1}: {r}" for j, r in enumerate(history)) or "(none)"
+                obs = RRG_SYSTEM_PROMPT + "\n\n" + RRG_TEMPLATE.format(
+                    task_description=self._tasks[i],
+                    step_number=self._current_step[i] + 1,
+                    total_steps=self._total_steps[i],
+                    ground_truth_action=action_str,
+                    num_observations=len(self.memory.get_bank(i)),
+                    observation_bank=obs_bank,
+                    reasoning_history=reasoning_hist,
+                    after_action_section=after_action_section,
+                )
+            postprocess_text_obs.append(obs)
+        return postprocess_text_obs
+
+    def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
+        for i in reversed(range(len(total_batch_list[batch_idx]))):
+            batch_item = total_batch_list[batch_idx][i]
+            if batch_item["active_masks"]:
+                info = total_infos[batch_idx][i]
+                won_value = float(info.get("won", True))
+                success["success_rate"].append(won_value)
+                return
+
+
 def make_envs(config):
     """
     Create enviroments 
@@ -689,10 +879,20 @@ def make_envs(config):
         from agent_system.environments.env_package.appworld import build_appworld_envs, appworld_projection
         _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker)
         _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n, resources_per_worker=resources_per_worker)
-        
+
         projection_f = partial(appworld_projection)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
+        return envs, val_envs
+    elif "rrg" in config.env.env_name.lower():
+        from agent_system.environments.env_package.rrg import build_rrg_envs, rrg_projection
+        trajectory_data_path = config.env.rrg.trajectory_data_path
+        _envs = build_rrg_envs(trajectory_data_path=trajectory_data_path, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True)
+        _val_envs = build_rrg_envs(trajectory_data_path=trajectory_data_path, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False)
+
+        projection_f = partial(rrg_projection)
+        envs = RRGEnvironmentManager(_envs, projection_f, config)
+        val_envs = RRGEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     else:
         print("Environment not supported")

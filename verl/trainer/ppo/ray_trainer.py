@@ -94,6 +94,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
+    RRG = 'rrg'
 
 
 @dataclass
@@ -357,6 +358,25 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.RRG:
+        from rrg import core_rrg
+        rrg_cite_rewards = data.non_tensor_batch.get('rrg_cite_rewards', np.zeros(data.batch['token_level_rewards'].shape[0]))
+        rrg_write_rewards = data.non_tensor_batch.get('rrg_write_rewards', np.zeros(data.batch['token_level_rewards'].shape[0]))
+        advantages, returns = core_rrg.compute_rrg_advantage(
+            token_level_rewards=data.batch['token_level_rewards'],
+            response_mask=data.batch['response_mask'],
+            index=data.non_tensor_batch['uid'],
+            traj_index=data.non_tensor_batch['traj_uid'],
+            cite_rewards=rrg_cite_rewards,
+            write_rewards=rrg_write_rewards,
+            cite_masks=data.batch.get('rrg_cite_mask', data.batch['response_mask']),
+            write_masks=data.batch.get('rrg_write_mask', torch.zeros_like(data.batch['response_mask'])),
+            w_cite=kwargs.get('rrg_w_cite', 1.0),
+            w_write=kwargs.get('rrg_w_write', 1.0),
+            w_final=kwargs.get('rrg_w_final', 0.0),
+        )
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -451,7 +471,8 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.GiGPO
+            AdvantageEstimator.GiGPO,
+            AdvantageEstimator.RRG,
         ]:
             self.use_critic = False
         else:
@@ -1114,6 +1135,46 @@ class RayPPOTrainer:
                             gamma=self.config.algorithm.gamma
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.RRG:
+                        from rrg.output_parser import parse_rrg_output, build_span_masks
+                        responses = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+                        cite_masks_list, write_masks_list = [], []
+                        parse_stats = {
+                            "has_citation_section": 0,
+                            "has_reasoning_section": 0,
+                            "has_writing_section": 0,
+                            "num_cited_indices": 0,
+                            "num_writing_updates": 0,
+                        }
+                        for i, resp in enumerate(responses):
+                            parsed = parse_rrg_output(resp)
+                            parse_stats["has_citation_section"] += int(parsed.citation_span != (0, 0))
+                            parse_stats["has_reasoning_section"] += int(parsed.reasoning_span != (0, 0))
+                            parse_stats["has_writing_section"] += int(parsed.writing_span != (0, 0))
+                            parse_stats["num_cited_indices"] += len(parsed.citation_indices)
+                            parse_stats["num_writing_updates"] += len(parsed.writing_updates)
+                            masks = build_span_masks(resp, batch.batch['responses'][i], self.tokenizer)
+                            cite_masks_list.append(masks['cite_mask'])
+                            write_masks_list.append(masks['write_mask'])
+                        batch.batch['rrg_cite_mask'] = torch.stack(cite_masks_list).to(batch.batch['responses'].device)
+                        batch.batch['rrg_write_mask'] = torch.stack(write_masks_list).to(batch.batch['responses'].device)
+                        if self.config.algorithm.rrg.get("debug_log", False):
+                            response_mask_for_debug = compute_response_mask(batch)
+                            debug_samples = int(self.config.algorithm.rrg.get("debug_log_samples", 3))
+                            mask_payload = {
+                                "batch_size": len(batch),
+                                **parse_stats,
+                                "cite_mask_tokens": int(batch.batch['rrg_cite_mask'].sum().item()),
+                                "write_mask_tokens": int(batch.batch['rrg_write_mask'].sum().item()),
+                                "response_tokens": int(response_mask_for_debug.sum().item()),
+                                "sample_outputs": responses[:debug_samples],
+                            }
+                            print(f"[RRG][trainer] {json.dumps({'event': 'span_mask_summary', **mask_payload}, ensure_ascii=False, default=str)}")
+                            debug_log_file = self.config.algorithm.rrg.get("debug_log_file", None)
+                            if debug_log_file:
+                                with open(debug_log_file, "a") as f:
+                                    f.write(json.dumps({"source": "trainer", "event": "span_mask_summary", **mask_payload}, ensure_ascii=False, default=str) + "\n")
                     
                     batch = adjust_batch(self.config, batch)
 
@@ -1233,6 +1294,9 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                            rrg_w_cite=self.config.algorithm.rrg.w_cite,
+                            rrg_w_write=self.config.algorithm.rrg.w_write,
+                            rrg_w_final=self.config.algorithm.rrg.w_final,
                         )
 
                     # update critic

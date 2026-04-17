@@ -79,8 +79,12 @@ class TrajectoryCollector:
         # if '<image>' in obs_content: 
         #     obs_content = obs_content.replace('<image>', '')
 
-        # Build chat structure
-        obs_content = ''
+        # Build chat structure.
+        # Only prepend a bare <image> token when the observation text doesn't already
+        # contain image placeholders (e.g. RRG embeds <image> inline in its template).
+        obs_content = ""
+        if is_multi_modal and (obs_text is None or "<image>" not in obs_text):
+            obs_content += "<image>\n"
         if obs_text is not None:
             obs_content += obs_text
         else:
@@ -107,7 +111,12 @@ class TrajectoryCollector:
         if is_multi_modal:
             # Replace image placeholder with vision tokens
             raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
-            row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
+            # obs_image may be a list of images (e.g. RRG: [before, after]) or a single array.
+            if isinstance(obs_image, list):
+                images = [process_image(img) for img in obs_image]
+            else:
+                images = [process_image(obs_image)]
+            row_dict['multi_modal_data'] = {'image': images}
             image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
             image_grid_thw = image_inputs['image_grid_thw']
             row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
@@ -328,8 +337,14 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.float32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
+
+        max_steps = self.config.env.get("max_steps", None)
+        max_steps = None if max_steps is None else int(max_steps)
+        unlimited_steps = max_steps is None or max_steps <= 0
+
         # Trajectory collection loop
-        for _step in range(self.config.env.max_steps):
+        _step = 0
+        while unlimited_steps or _step < max_steps:
             active_masks = np.logical_not(is_done)
 
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
@@ -399,6 +414,8 @@ class TrajectoryCollector:
                 
             # Update observations for next step
             obs = next_obs
+
+            _step += 1
 
             # Break if all environments are done
             if is_done.all():

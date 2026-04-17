@@ -14,3 +14,4 @@
 # limitations under the License.
 
 from .episode import EpisodeRewardManager
+from .rrg_reward import RRGRewardManager
