@@ -128,7 +128,7 @@ class FactBankMemory(BaseMemory):
         assert self._banks is not None
         bank = self._banks[env_idx]
         if not bank:
-            return "(empty)"
+            return "empty"
         lines = []
         for i, slot in enumerate(bank):
             lines.append(f"{i}: {slot.current}")

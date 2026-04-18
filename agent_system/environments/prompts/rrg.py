@@ -32,4 +32,4 @@ Current GUI screenshot (before the ground-truth action):
 <image>{after_action_section}\
 """
 
-_AFTER_ACTION_SECTION = "\nGUI screenshot (after the ground-truth action):\n<image>"
+_AFTER_ACTION_SECTION = "\nAfter GUI screenshot (after the ground-truth action):\n<image>"

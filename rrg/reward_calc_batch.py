@@ -214,8 +214,8 @@ def compute_R_fact(fact: FactRecord) -> float:
 
 
 def compute_fact_quality(judgment: FactJudgment) -> float:
-    return (
-        LAMBDA_VAL * judgment.correctness
+    return judgment.correctness * (
+        LAMBDA_VAL
         + LAMBDA_ATOM * judgment.atomicity
         + LAMBDA_GRAN * judgment.granularity
     )

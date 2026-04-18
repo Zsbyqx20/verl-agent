@@ -251,10 +251,13 @@ Define the intrinsic quality score of a fact version as:
 
 $
 Q(f_(i, j)) =
-lambda_"val" V(f_(i, j)) +
+V(f_(i, j)) (lambda_"val" +
 lambda_"atom" A(f_(i, j)) +
-lambda_"gran" G(f_(i, j))
+lambda_"gran" G(f_(i, j)))
 $
+
+Correctness $V$ multiplies the entire expression so that a factually incorrect observation ($V = 0$) receives zero quality regardless of its structural quality.
+A fact that is well-formed but describes a state that does not exist in the current screenshot should not be rewarded at all.
 
 If $cal(U)(f_(i, j)) = emptyset$, we assign
 

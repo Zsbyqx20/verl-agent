@@ -632,11 +632,13 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                 f.write(json.dumps({"source": "env", **message}, ensure_ascii=False, default=str) + "\n")
 
     def reset(self, kwargs):
+        from agent_system.environments.prompts.rrg import RRG_SYSTEM_PROMPT
         text_obs, image_obs, infos = self.envs.reset()
         batch_size = len(text_obs)
         self.memory.reset(batch_size=batch_size)
         self.reasoning_memory = [[] for _ in range(batch_size)]
         self._current_step = [0] * batch_size
+        self._is_done = [False] * batch_size
         self._tasks = [info.get("task", "") for info in infos]
         self._total_steps = [info.get("total_steps", 1) for info in infos]
         self.step_metadata = {}
@@ -653,15 +655,23 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
             "sample_actions": [info.get("ground_truth_action", "") for info in infos[:self._debug_log_samples]],
         })
 
-        return {"text": full_text_obs, "image": image_list, "anchor": text_obs}, infos
+        return {
+            "text": full_text_obs,
+            "image": image_list,
+            "anchor": text_obs,
+            "system": [RRG_SYSTEM_PROMPT] * batch_size,
+        }, infos
 
     def step(self, text_actions: List[str]):
+        from agent_system.environments.prompts.rrg import RRG_SYSTEM_PROMPT
         from rrg.output_parser import parse_rrg_output
 
         actions, valids = self.projection_f(text_actions)
         batch_size = len(text_actions)
 
         # Parse each model output; snapshot bank BEFORE writing new facts.
+        # Skip bank updates and reasoning history for already-done envs to avoid
+        # phantom metadata entries that would waste LLM judge calls in the reward manager.
         all_updates = []
         all_reasoning = []
         all_cited = []
@@ -675,6 +685,10 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
             all_cited.append(parse_result.citation_indices)
             all_reasoning.append(parse_result.reasoning_text)
             all_writing_updates.append(parse_result.writing_updates)
+
+            if self._is_done[i]:
+                all_updates.append([])
+                continue
 
             # Update fact bank and reasoning history
             updates = parse_result.writing_updates
@@ -707,7 +721,10 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
 
         # Accumulate step metadata for reward manager, keyed by env slot index.
+        # Skip already-done envs — their outputs are phantom and would waste judge calls.
         for i in range(batch_size):
+            if self._is_done[i]:
+                continue
             key = str(i)
             if key not in self.step_metadata:
                 self.step_metadata[key] = []
@@ -722,9 +739,11 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                 "model_output": text_actions[i],
             })
 
-        # Update step counters
+        # Update done flags and step counters for active envs only.
         for i in range(batch_size):
-            self._current_step[i] += 1
+            if not self._is_done[i]:
+                self._is_done[i] = bool(dones[i])
+                self._current_step[i] += 1
 
         # Add action validity to infos
         for i, info in enumerate(infos):
@@ -734,14 +753,19 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
         full_text_obs = self.build_text_obs(text_obs, infos)
         image_list = image_obs if image_obs and image_obs[0] is not None else None
 
-        next_observations = {"text": full_text_obs, "image": image_list, "anchor": text_obs}
+        next_observations = {
+            "text": full_text_obs,
+            "image": image_list,
+            "anchor": text_obs,
+            "system": [RRG_SYSTEM_PROMPT] * batch_size,
+        }
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
         return next_observations, rewards, dones, infos
 
     def build_text_obs(self, text_obs: List[str], infos: List[dict], init: bool = False) -> List[str]:
-        from agent_system.environments.prompts.rrg import RRG_SYSTEM_PROMPT, RRG_TEMPLATE_INIT, RRG_TEMPLATE, _AFTER_ACTION_SECTION
+        from agent_system.environments.prompts.rrg import RRG_TEMPLATE_INIT, RRG_TEMPLATE, _AFTER_ACTION_SECTION
 
         postprocess_text_obs = []
         batch_size = len(text_obs)
@@ -755,7 +779,7 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
             after_action_section = _AFTER_ACTION_SECTION if info_i.get("has_after_image", False) else ""
 
             if init:
-                obs = RRG_SYSTEM_PROMPT + "\n\n" + RRG_TEMPLATE_INIT.format(
+                obs = RRG_TEMPLATE_INIT.format(
                     task_description=self._tasks[i],
                     total_steps=self._total_steps[i],
                     ground_truth_action=action_str,
@@ -764,9 +788,8 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
             else:
                 obs_bank = self.memory.get_bank_formatted(i)
                 history = self.reasoning_memory[i][-reasoning_hist_len:] if reasoning_hist_len > 0 else []
-                offset = max(0, len(self.reasoning_memory[i]) - len(history))
-                reasoning_hist = "\n".join(f"Step {offset + j + 1}: {r}" for j, r in enumerate(history)) or "(none)"
-                obs = RRG_SYSTEM_PROMPT + "\n\n" + RRG_TEMPLATE.format(
+                reasoning_hist = "\n".join(f"{j}: {r}" for j, r in enumerate(history)) or "empty"
+                obs = RRG_TEMPLATE.format(
                     task_description=self._tasks[i],
                     step_number=self._current_step[i] + 1,
                     total_steps=self._total_steps[i],

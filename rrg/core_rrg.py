@@ -19,7 +19,6 @@ import torch
 def _group_normalize(
     scores: torch.Tensor,
     index: np.ndarray,
-    traj_index: np.ndarray,
     epsilon: float = 1e-6,
     remove_std: bool = True,
 ) -> torch.Tensor:
@@ -28,8 +27,6 @@ def _group_normalize(
     Args:
         scores: ``(bs,)`` scalar per sample.
         index: ``(bs,)`` group IDs (samples with the same ID form a group).
-        traj_index: ``(bs,)`` trajectory UIDs (used for deduplication within a
-            group when ``compute_mean_std_cross_steps`` is True).
         epsilon: numerical stability term.
         remove_std: if True, only subtract mean (Dr.GRPO style); if False,
             also divide by std (original GRPO style).
@@ -38,16 +35,11 @@ def _group_normalize(
         Normalized scores ``(bs,)``.
     """
     id2scores: dict[str, list[torch.Tensor]] = defaultdict(list)
-    seen_pairs: set[tuple] = set()
 
     bsz = scores.shape[0]
     with torch.no_grad():
         for i in range(bsz):
-            pair = (index[i], traj_index[i])
-            if pair in seen_pairs:
-                continue
             id2scores[index[i]].append(scores[i])
-            # Don't deduplicate by (index, traj) — include all steps
 
         id2mean: dict = {}
         id2std: dict = {}
@@ -79,15 +71,16 @@ def _group_normalize(
 def compute_rrg_advantage(
     token_level_rewards: torch.Tensor,   # (bs, response_length) — combined scalar
     response_mask: torch.Tensor,         # (bs, response_length)
-    index: np.ndarray,                   # (bs,) — group uid for normalization
-    traj_index: np.ndarray,              # (bs,) — trajectory uid
+    index: np.ndarray,                   # (bs,) — step-group uid for normalization
     cite_rewards: np.ndarray,            # (bs,) — R_cite per step
     write_rewards: np.ndarray,           # (bs,) — R_write per step
     cite_masks: torch.Tensor,            # (bs, response_length) — bool
     write_masks: torch.Tensor,           # (bs, response_length) — bool
     w_cite: float = 1.0,
     w_write: float = 1.0,
-    w_final: float = 0.0,               # phase 2
+    w_final: float = 0.0,
+    final_rewards: np.ndarray | None = None,   # (bs,) — R_final per step (trajectory-level)
+    traj_index: np.ndarray | None = None,      # (bs,) — traj_uid for trajectory-level grouping
     epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute span-masked advantages for RRG.
@@ -107,8 +100,8 @@ def compute_rrg_advantage(
     write_rewards_t = torch.tensor(write_rewards, dtype=torch.float32, device=device)
 
     # Group normalize each signal
-    a_cite = _group_normalize(cite_rewards_t, index, traj_index, epsilon, remove_std=True)
-    a_write = _group_normalize(write_rewards_t, index, traj_index, epsilon, remove_std=True)
+    a_cite = _group_normalize(cite_rewards_t, index, epsilon, remove_std=True)
+    a_write = _group_normalize(write_rewards_t, index, epsilon, remove_std=True)
 
     # Broadcast to token level via span masks
     cite_masks_f = cite_masks.float().to(device)
@@ -119,8 +112,12 @@ def compute_rrg_advantage(
         + w_write * a_write.unsqueeze(-1) * write_masks_f
     )
 
-    # Phase 2: add w_final * A_final (trajectory-level) to both cite and write spans
-    # Currently w_final=0.0, so this is a no-op.
+    # Trajectory-level final reward: broadcast A_final to all cite + write tokens
+    if w_final != 0.0 and final_rewards is not None and traj_index is not None:
+        final_rewards_t = torch.tensor(final_rewards, dtype=torch.float32, device=device)
+        a_final = _group_normalize(final_rewards_t, traj_index, epsilon, remove_std=True)
+        active_span = (cite_masks_f + write_masks_f).clamp(max=1.0)
+        advantages = advantages + w_final * a_final.unsqueeze(-1) * active_span
 
     # Apply response mask
     advantages = advantages * response_mask

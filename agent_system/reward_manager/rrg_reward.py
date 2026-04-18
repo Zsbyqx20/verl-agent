@@ -146,8 +146,8 @@ def compute_fact_quality(
     lambda_atom: float,
     lambda_gran: float,
 ) -> float:
-    return (
-        lambda_val * judgment.correctness
+    return judgment.correctness * (
+        lambda_val
         + lambda_atom * judgment.atomicity
         + lambda_gran * judgment.granularity
     )
@@ -420,9 +420,17 @@ class RRGRewardManager:
                 unique_trajs_ordered.append(uid)
                 seen.add(uid)
 
-        # Per-item citation and writing rewards
+        # Per-item citation, writing, and final rewards
         cite_rewards = np.zeros(batch_size, dtype=np.float32)
         write_rewards = np.zeros(batch_size, dtype=np.float32)
+        final_rewards = np.zeros(batch_size, dtype=np.float32)
+        # Per-item step-group UIDs for step-level normalization:
+        # group = (source_trajectory, step_t) × n_rollouts, not all steps together.
+        uids = data.non_tensor_batch.get("uid", None)
+        step_group_uids = np.array(
+            [str(u) for u in (uids if uids is not None else np.arange(batch_size))],
+            dtype=object,
+        )
         reward_debug_examples = []
         total_meta_steps = 0
         total_writes = 0
@@ -441,10 +449,10 @@ class RRGRewardManager:
             total_writes += sum(len(meta.get("writing_updates", [])) for meta in traj_meta)
 
             # Phase 1: Compute citation rewards (call J_cite per step)
-            step_cite_rewards, cite_debug = self._compute_citation_rewards(traj_meta, total_steps)
+            step_cite_rewards, cite_debug, necessary_sets = self._compute_citation_rewards(traj_meta, total_steps)
 
-            # Phase 2: Compute writing rewards (call J_fact per written fact)
-            step_write_rewards, write_debug = self._compute_writing_rewards(traj_meta, total_steps)
+            # Phase 2: Compute writing rewards with T(f) using citation judgments
+            step_write_rewards, write_debug = self._compute_writing_rewards(traj_meta, total_steps, necessary_sets)
 
             if self.debug_log and len(reward_debug_examples) < self.debug_log_samples:
                 debug_steps = []
@@ -468,12 +476,22 @@ class RRGRewardManager:
                     "steps": debug_steps,
                 })
 
-            # Assign to batch indices
+            # Assign final reward (R_final = 1 for bare-finish GUI tasks).
+            # All steps of this trajectory receive the same scalar for trajectory-level
+            # normalization in compute_rrg_advantage.
+            for batch_idx in traj_indices:
+                final_rewards[batch_idx] = 1.0
+
+            # Assign to batch indices and stamp per-step group UIDs.
+            # step_group_uid = f"{trajectory_uid}_{step_t}" so that normalization
+            # groups the n rollouts at each step t, not all steps together.
             for local_idx, batch_idx in enumerate(traj_indices):
                 if local_idx < len(step_cite_rewards):
                     cite_rewards[batch_idx] = step_cite_rewards[local_idx]
                 if local_idx < len(step_write_rewards):
                     write_rewards[batch_idx] = step_write_rewards[local_idx]
+                if uids is not None:
+                    step_group_uids[batch_idx] = f"{uids[batch_idx]}_{local_idx}"
 
             # Set scalar reward at last valid token for each item (for metric compatibility)
             for local_idx, batch_idx in enumerate(traj_indices):
@@ -512,16 +530,23 @@ class RRGRewardManager:
                 "reward_extra_info": {
                     "rrg_cite_rewards": cite_rewards.tolist(),
                     "rrg_write_rewards": write_rewards.tolist(),
+                    "rrg_final_rewards": final_rewards.tolist(),
+                    "rrg_step_group_uid": step_group_uids.tolist(),
                 },
             }
         return reward_tensor
 
     def _compute_citation_rewards(
         self, traj_meta: list[dict], total_steps: int
-    ) -> tuple[list[float], dict[int, dict]]:
-        """Call J_cite for each step and compute R_cite_step."""
+    ) -> tuple[list[float], dict[int, dict], dict[int, set[int]]]:
+        """Call J_cite for each step and compute R_cite_step.
+
+        Returns step rewards, debug details, and necessary_sets (needed by
+        _compute_writing_rewards for T(f) validated-use tracking).
+        """
         step_rewards = []
         debug_details: dict[int, dict] = {}
+        necessary_sets: dict[int, set[int]] = {}
 
         with ThreadPoolExecutor(max_workers=self.max_judge_workers) as pool:
             futures = {}
@@ -534,6 +559,7 @@ class RRGRewardManager:
 
                 if not image_path or not os.path.isfile(image_path):
                     step_rewards.append(0.0)
+                    necessary_sets[t] = set()
                     debug_details[t] = {
                         "error": "missing_image",
                         "image_path": image_path,
@@ -555,6 +581,7 @@ class RRGRewardManager:
                 try:
                     judgment = fut.result()
                     necessary_set = set(judgment.necessary_indices)
+                    necessary_sets[t] = necessary_set
                     _, _, _, R = compute_cite_step_reward(
                         cited_set, necessary_set,
                         self.alpha_prec, self.alpha_rec, self.alpha_rep,
@@ -574,6 +601,7 @@ class RRGRewardManager:
                             "reward": R,
                         }
                 except Exception as exc:
+                    necessary_sets[t] = set()
                     results[t] = 0.0
                     debug_details[t] = {
                         "error": repr(exc),
@@ -585,23 +613,27 @@ class RRGRewardManager:
                         "image_path": traj_meta[t].get("screenshot_path", ""),
                     })
 
-        return [results.get(t, 0.0) for t in range(len(traj_meta))], debug_details
+        return [results.get(t, 0.0) for t in range(len(traj_meta))], debug_details, necessary_sets
 
     def _compute_writing_rewards(
-        self, traj_meta: list[dict], total_steps: int
+        self, traj_meta: list[dict], total_steps: int, necessary_sets: dict[int, set[int]]
     ) -> tuple[list[float], dict[int, dict]]:
         """Call J_fact for each written fact and compute R_write_step.
 
-        For the initial implementation, we compute quality scores for each
-        written fact but skip the future-use (T) computation — that requires
-        knowing citation judgments for all future steps, which adds complexity.
-        This gives a quality-only signal; T computation will be added in phase 2.
+        Three-pass implementation:
+          Pass 1: Run J_fact concurrently for all written facts, collect FactVersionRecords.
+          Pass 2: Mark validated uses using citation judgments from necessary_sets.
+          Pass 3: Compute T(f) and R_fact per version; assign rewards back to write step.
         """
         step_rewards = [0.0] * len(traj_meta)
         debug_details: dict[int, dict] = {}
 
+        # Pass 1: collect quality scores for all written facts
+        # fact_versions[obs_index] = list of FactVersionRecord in write order
+        fact_versions: dict[int, list[FactVersionRecord]] = {}
+
         with ThreadPoolExecutor(max_workers=self.max_judge_workers) as pool:
-            futures = {}
+            futures: dict = {}
             for t, meta in enumerate(traj_meta):
                 task = meta.get("task", "")
                 image_path = meta.get("screenshot_path", "")
@@ -627,17 +659,28 @@ class RRGRewardManager:
 
             for fut in as_completed(futures):
                 t, content, upd = futures[fut]
+                obs_index = upd.get("observation_index")
+                action = upd.get("action", "add")
                 try:
                     judgment = fut.result()
                     quality = compute_fact_quality(
                         judgment,
                         self.lambda_val, self.lambda_atom, self.lambda_gran,
                     )
-                    step_rewards[t] += quality
+                    version = FactVersionRecord(
+                        obs_index=obs_index,
+                        step_written=t,
+                        version=-1,
+                        action=action,
+                        content=content,
+                        judgment=judgment,
+                        quality_score=quality,
+                    )
+                    fact_versions.setdefault(obs_index, []).append(version)
                     if self.debug_log:
                         debug_details.setdefault(t, {"facts": []})["facts"].append({
-                            "action": upd.get("action", ""),
-                            "observation_index": upd.get("observation_index", None),
+                            "action": action,
+                            "observation_index": obs_index,
                             "content": content[:300],
                             "correctness": judgment.correctness,
                             "atomicity": judgment.atomicity,
@@ -648,8 +691,8 @@ class RRGRewardManager:
                 except Exception as exc:
                     if self.debug_log:
                         debug_details.setdefault(t, {"facts": []})["facts"].append({
-                            "action": upd.get("action", ""),
-                            "observation_index": upd.get("observation_index", None),
+                            "action": action,
+                            "observation_index": obs_index,
                             "content": content[:300],
                             "error": repr(exc),
                         })
@@ -659,6 +702,53 @@ class RRGRewardManager:
                         "content": content[:300],
                         "image_path": traj_meta[t].get("screenshot_path", ""),
                     })
+
+        # Sort each slot's versions by step_written and assign version index
+        for obs_index, versions in fact_versions.items():
+            versions.sort(key=lambda v: v.step_written)
+            for j, v in enumerate(versions):
+                v.version = j
+
+        # Pass 2: mark validated uses using citation judgments
+        for t, necessary_set in necessary_sets.items():
+            if not necessary_set:
+                continue
+            cited_at_t = set(traj_meta[t].get("cited_indices", []))
+            for obs_index in cited_at_t & necessary_set:
+                versions = fact_versions.get(obs_index)
+                if not versions:
+                    continue
+                # Active version = latest written strictly before step t
+                active = next((v for v in reversed(versions) if v.step_written < t), None)
+                if active is None:
+                    continue
+                m = sum(1 for (u, _) in active.validated_uses if u < t)
+                active.validated_uses.append((t, m))
+
+        # Pass 3: compute T(f) and R_fact per version, assign to step_rewards
+        for obs_index, versions in fact_versions.items():
+            previous: FactVersionRecord | None = None
+            for version in versions:
+                version.T = compute_T_version(
+                    version.validated_uses, version.step_written, total_steps, self.gamma_discount
+                )
+                version.R_fact = compute_R_fact_version(
+                    version, previous, self.lambda_use, self.update_bonus_scale
+                )
+                step_rewards[version.step_written] += version.R_fact
+                if self.debug_log and version.step_written < len(traj_meta):
+                    for entry in debug_details.get(version.step_written, {}).get("facts", []):
+                        if (
+                            entry.get("observation_index") == obs_index
+                            and entry.get("action") == version.action
+                            and not entry.get("error")
+                        ):
+                            entry["T"] = version.T
+                            entry["R_fact"] = version.R_fact
+                            entry["validated_uses"] = version.validated_uses
+                            entry["quality"] = version.quality_score
+                            break
+                previous = version
 
         if self.debug_log:
             for t, detail in debug_details.items():

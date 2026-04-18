@@ -360,20 +360,24 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.RRG:
         from rrg import core_rrg
-        rrg_cite_rewards = data.non_tensor_batch.get('rrg_cite_rewards', np.zeros(data.batch['token_level_rewards'].shape[0]))
-        rrg_write_rewards = data.non_tensor_batch.get('rrg_write_rewards', np.zeros(data.batch['token_level_rewards'].shape[0]))
+        _bsz = data.batch['token_level_rewards'].shape[0]
+        rrg_cite_rewards = data.non_tensor_batch.get('rrg_cite_rewards', np.zeros(_bsz))
+        rrg_write_rewards = data.non_tensor_batch.get('rrg_write_rewards', np.zeros(_bsz))
+        rrg_final_rewards = data.non_tensor_batch.get('rrg_final_rewards', np.ones(_bsz))
+        traj_uid_index = np.array(data.non_tensor_batch.get('traj_uid', np.arange(_bsz)), dtype=object)
         advantages, returns = core_rrg.compute_rrg_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
             response_mask=data.batch['response_mask'],
-            index=data.non_tensor_batch['uid'],
-            traj_index=data.non_tensor_batch['traj_uid'],
+            index=np.array(data.non_tensor_batch.get('rrg_step_group_uid', data.non_tensor_batch['uid'])),
             cite_rewards=rrg_cite_rewards,
             write_rewards=rrg_write_rewards,
-            cite_masks=data.batch.get('rrg_cite_mask', data.batch['response_mask']),
+            cite_masks=data.batch.get('rrg_cite_mask', torch.zeros_like(data.batch['response_mask'])),
             write_masks=data.batch.get('rrg_write_mask', torch.zeros_like(data.batch['response_mask'])),
             w_cite=kwargs.get('rrg_w_cite', 1.0),
             w_write=kwargs.get('rrg_w_write', 1.0),
             w_final=kwargs.get('rrg_w_final', 0.0),
+            final_rewards=rrg_final_rewards,
+            traj_index=traj_uid_index,
         )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns

@@ -90,11 +90,19 @@ class TrajectoryCollector:
         else:
             print(f"Warning: No text observation found!")
 
-        
-        chat = np.array([{
-            "content": obs_content,
-            "role": "user",
-        }])
+        obs_systems = obs.get('system', None)
+        obs_system = obs_systems[item] if obs_systems is not None else None
+
+        if obs_system is not None:
+            chat = np.array([
+                {"content": obs_system, "role": "system"},
+                {"content": obs_content, "role": "user"},
+            ])
+        else:
+            chat = np.array([{
+                "content": obs_content,
+                "role": "user",
+            }])
         
         # Apply chat template
         prompt_with_chat_template = self.tokenizer.apply_chat_template(

@@ -1,9 +1,9 @@
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=rrg \
     algorithm.rrg.w_cite=1.0 \
-    algorithm.rrg.w_write=1.0 \
-    algorithm.rrg.w_final=0.0 \
-    algorithm.rrg.judge_model=Qwen/Qwen3-VL-32B-Instruct \
+    algorithm.rrg.w_write=2.0 \
+    algorithm.rrg.w_final=1.0 \
+    algorithm.rrg.judge_model=doubao-seed-2-0-lite-260215 \
     algorithm.rrg.max_judge_workers=8 \
     algorithm.rrg.max_retries=3 \
     algorithm.rrg.debug_log=True \
@@ -11,12 +11,12 @@ python3 -m verl.trainer.main_ppo \
     reward_model.reward_manager=rrg \
     data.train_files=data/train.parquet \
     data.val_files=data/test.parquet \
-    data.train_batch_size=16 \
-    data.val_batch_size=16 \
+    data.train_batch_size=8 \
+    data.val_batch_size=8 \
     data.max_prompt_length=16384 \
     data.max_response_length=2048 \
     data.return_raw_chat=True \
-    algorithm.rrg.judge_base_url=http://localhost:8000/v1 \
+    algorithm.rrg.judge_base_url=https://ark.cn-beijing.volces.com/api/v3 \
     actor_rollout_ref.model.path=/data/liuguohong/workspace/ms-swift/output/rg-20260415/checkpoint-106-merged \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
@@ -31,7 +31,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -41,9 +41,9 @@ python3 -m verl.trainer.main_ppo \
     env.rollout.n=4 \
     env.rrg.trajectory_data_path=data/traces_clean.json \
     env.rrg.reasoning_history_length=5 \
-    trainer.total_epochs=10 \
+    trainer.total_epochs=2 \
     trainer.project_name=rrg_training \
     trainer.experiment_name=rrg_boot \
     trainer.logger='["console"]' \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=8 \
     trainer.val_before_train=False
