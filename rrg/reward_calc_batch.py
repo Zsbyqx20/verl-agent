@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import json
 import os
 import random
@@ -262,6 +263,7 @@ def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+@functools.lru_cache(maxsize=None)
 def encode_image(image_path: str) -> str:
     if not os.path.isfile(image_path):
         raise FileNotFoundError(f"Image not found: {image_path}")

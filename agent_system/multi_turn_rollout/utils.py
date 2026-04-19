@@ -120,7 +120,7 @@ def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
         del data
     elif mode == "copy":
         to_add = size_divisor - remainder
-        dup_indices = np.random.choice(bs, to_add, replace=False)
+        dup_indices = np.random.choice(bs, to_add, replace=to_add > bs)
         dup_proto = data.select_idxs(dup_indices)
 
         adjusted_batch = DataProto.concat([data, dup_proto])
