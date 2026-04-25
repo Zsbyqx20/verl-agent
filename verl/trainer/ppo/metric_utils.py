@@ -189,6 +189,89 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     return metrics
 
 
+def compute_rrg_metrics(batch: DataProto) -> Dict[str, Any]:
+    """RRG-specific observability metrics.
+
+    Aggregates per-step and per-trajectory signals from the RRG reward manager
+    into scalar metrics suitable for wandb/swanlab line charts. Returns an
+    empty dict if the RRG reward extras are not present.
+    """
+    nt = batch.non_tensor_batch
+    if "rrg_fact_rewards" not in nt:
+        return {}
+
+    fact_r = np.asarray(nt["rrg_fact_rewards"], dtype=np.float32)
+    reason_r = np.asarray(nt["rrg_reason_rewards"], dtype=np.float32)
+    final_r = np.asarray(nt["rrg_final_rewards"], dtype=np.float32)
+    fact_tokens = np.asarray(nt.get("rrg_fact_tokens", np.zeros_like(fact_r)), dtype=np.float32)
+    reason_tokens = np.asarray(nt.get("rrg_reason_tokens", np.zeros_like(fact_r)), dtype=np.float32)
+
+    metrics: Dict[str, Any] = {
+        # Per-step scalars
+        "rrg/fact_reward/mean": float(fact_r.mean()) if fact_r.size else 0.0,
+        "rrg/fact_reward/positive_rate": float((fact_r > 0).mean()) if fact_r.size else 0.0,
+        "rrg/fact_reward/negative_rate": float((fact_r < 0).mean()) if fact_r.size else 0.0,
+        "rrg/reason_reward/mean": float(reason_r.mean()) if reason_r.size else 0.0,
+        "rrg/reason_reward/abs_mean": float(np.abs(reason_r).mean()) if reason_r.size else 0.0,
+        "rrg/final_reward/step_mean": float(final_r.mean()) if final_r.size else 0.0,
+        # Useful-fact rate: fraction of steps where the final judge attributed at least one written fact.
+        # r_fact > 0 is exactly the useful-and-written case; "write nothing" → 0; "write useless" → < 0.
+        "rrg/useful_rate_step": float((fact_r > 0).mean()) if fact_r.size else 0.0,
+        # Token-pressure health
+        "rrg/fact_tokens/mean": float(fact_tokens.mean()) if fact_tokens.size else 0.0,
+        "rrg/fact_tokens/max": float(fact_tokens.max()) if fact_tokens.size else 0.0,
+        "rrg/reason_tokens/mean": float(reason_tokens.mean()) if reason_tokens.size else 0.0,
+        "rrg/reason_tokens/max": float(reason_tokens.max()) if reason_tokens.size else 0.0,
+    }
+
+    # Per-trajectory success rate (dedupe by traj_uid so trajectory length doesn't bias the average).
+    traj_uid = nt.get("traj_uid")
+    if traj_uid is not None and len(traj_uid) > 0:
+        _, unique_idx = np.unique(np.asarray(traj_uid), return_index=True)
+        metrics["rrg/traj/success_rate"] = float(final_r[unique_idx].mean())
+
+    # Span-scoped advantage magnitudes (knob-balance diagnostic).
+    adv = batch.batch.get("advantages")
+    fact_mask = batch.batch.get("rrg_fact_mask")
+    reason_mask = batch.batch.get("rrg_reason_mask")
+    if adv is not None and fact_mask is not None and reason_mask is not None:
+        fm = fact_mask.float()
+        rm = reason_mask.float()
+        abs_adv = adv.abs()
+        fact_tok_sum = fm.sum().clamp(min=1.0)
+        reason_tok_sum = rm.sum().clamp(min=1.0)
+        metrics["rrg/adv/fact_abs_mean"] = float((abs_adv * fm).sum().item() / fact_tok_sum.item())
+        metrics["rrg/adv/reason_abs_mean"] = float((abs_adv * rm).sum().item() / reason_tok_sum.item())
+        metrics["rrg/response_length/fact_mean"] = float(fm.sum(-1).mean().item())
+        metrics["rrg/response_length/reason_mean"] = float(rm.sum(-1).mean().item())
+        if metrics["rrg/adv/reason_abs_mean"] > 0:
+            metrics["rrg/adv/ratio_fact_over_reason"] = (
+                metrics["rrg/adv/fact_abs_mean"] / metrics["rrg/adv/reason_abs_mean"]
+            )
+
+    # Parse stats stashed by the mask-building site (ray_trainer.py).
+    parse_stats = batch.meta_info.get("rrg_parse_stats") if hasattr(batch, "meta_info") else None
+    if isinstance(parse_stats, dict):
+        n = max(1, int(parse_stats.get("batch_size", 0)))
+        metrics["rrg/parse/has_reasoning_rate"] = float(parse_stats.get("has_reasoning_section", 0)) / n
+        metrics["rrg/parse/has_writing_rate"] = float(parse_stats.get("has_writing_section", 0)) / n
+        metrics["rrg/parse/writes_per_response_mean"] = float(parse_stats.get("num_writing_updates", 0)) / n
+
+    # Judge operational stats stashed by the reward manager.
+    judge_stats = batch.meta_info.get("rrg_judge_stats") if hasattr(batch, "meta_info") else None
+    if isinstance(judge_stats, dict):
+        metrics["rrg/judge/final_calls"] = int(judge_stats.get("final_calls", 0))
+        metrics["rrg/judge/final_failures"] = int(judge_stats.get("final_failures", 0))
+        metrics["rrg/judge/rank_calls"] = int(judge_stats.get("rank_calls", 0))
+        metrics["rrg/judge/rank_failures"] = int(judge_stats.get("rank_failures", 0))
+        total_calls = metrics["rrg/judge/final_calls"] + metrics["rrg/judge/rank_calls"]
+        total_fails = metrics["rrg/judge/final_failures"] + metrics["rrg/judge/rank_failures"]
+        if total_calls > 0:
+            metrics["rrg/judge/failure_rate"] = total_fails / total_calls
+
+    return metrics
+
+
 def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.

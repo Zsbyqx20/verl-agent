@@ -17,10 +17,14 @@ python3 -m examples.data_preprocess.prepare_rrg \
 # Step 2: Run RRG training
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=rrg \
-    algorithm.rrg.w_cite=1.0 \
-    algorithm.rrg.w_write=1.0 \
-    algorithm.rrg.w_final=0.0 \
-    algorithm.rrg.judge_model=doubao-seed-2-0-pro-260215 \
+    algorithm.rrg.w_fact=1.0 \
+    algorithm.rrg.w_reason=1.0 \
+    algorithm.rrg.w_final=1.0 \
+    algorithm.rrg.token_scale=16.0 \
+    algorithm.rrg.alpha_fact_penalty=0.2 \
+    algorithm.rrg.reason_length_penalty=0.3 \
+    algorithm.rrg.final_judge_model=doubao-seed-2-0-pro-260215 \
+    algorithm.rrg.rank_judge_model=doubao-seed-2-0-pro-260215 \
     algorithm.rrg.max_judge_workers=16 \
     algorithm.rrg.max_retries=3 \
     reward_model.reward_manager=rrg \

@@ -8,32 +8,59 @@ from typing import Any
 import torch
 
 
+# ---------------------------------------------------------------------------
+# Prompt-injection sanitization
+# ---------------------------------------------------------------------------
+# Tokens that would be reinterpreted as vision placeholders if a model-authored
+# string is concatenated back into a multimodal prompt. The rollout's
+# ``preprocess_single_sample`` counts ``<image>`` occurrences, and the Qwen-VL
+# substitutions consume ``<|vision_start|>``/``<|image_pad|>``/``<|vision_end|>``.
+# A model that learns to emit any of these literally will desync image_grid_thw
+# from the prompt's vision placeholder count and crash the rollout.
+_SANITIZE_PATTERNS = (
+    "<image>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|image_pad|>",
+    "<|placeholder|>",
+)
+
+
+def sanitize_for_prompt(text: str) -> str:
+    """Strip tokens that would be reinterpreted as image markers when re-injected into a multimodal prompt."""
+    if not text:
+        return text
+    for pat in _SANITIZE_PATTERNS:
+        if pat in text:
+            text = text.replace(pat, "")
+    return text
+
+
 @dataclass
 class RRGParseResult:
-    """Parsed model output for one RRG generation."""
-    citation_text: str = ""
-    citation_indices: list[int] = field(default_factory=list)
+    """Parsed model output for one RRG generation.
+
+    RRG v2 output has two sections only: action reasoning and observation
+    writing (add-only). Citation is removed.
+    """
     reasoning_text: str = ""
     writing_text: str = ""
     writing_updates: list[dict[str, Any]] = field(default_factory=list)
     # Character offsets in the full output string (start, end)
-    citation_span: tuple[int, int] = (0, 0)
     reasoning_span: tuple[int, int] = (0, 0)
     writing_span: tuple[int, int] = (0, 0)
 
 
 # ---------------------------------------------------------------------------
-# Section header patterns
+# Section header patterns (legacy plain-text format)
 # ---------------------------------------------------------------------------
 
 _SECTION_RE = re.compile(
-    r"\[Fact Citation\]|\[Action Reasoning\]|\[Fact Writing\]",
+    r"\[Action Reasoning\]|\[Fact Writing\]|\[Observation Writing\]",
     re.IGNORECASE,
 )
 
-_CITE_INDICES_RE = re.compile(r"indices?\s*:\s*\[([^\]]*)\]", re.IGNORECASE)
 _ADD_RE = re.compile(r"ADD\s+(\d+)\s*:\s*(.+)", re.IGNORECASE)
-_UPDATE_RE = re.compile(r"UPDATE\s+(\d+)\s*:\s*(.+)", re.IGNORECASE)
 
 
 def _find_json_object_span(text: str) -> tuple[int, int] | None:
@@ -122,51 +149,33 @@ def _find_json_field_value_span(text: str, field: str, object_start: int, object
     return value_start, value_end
 
 
-def _coerce_int_list(value: Any) -> list[int]:
-    if value is None:
-        return []
-    if isinstance(value, int):
-        return [value]
-    if isinstance(value, str):
-        return [int(x) for x in re.findall(r"\d+", value)]
-    if isinstance(value, list):
-        out = []
-        for item in value:
-            if isinstance(item, int):
-                out.append(item)
-            elif isinstance(item, str) and item.strip().isdigit():
-                out.append(int(item.strip()))
-        return out
-    return []
-
-
 def _normalize_update(update: Any) -> dict[str, Any] | None:
+    """Coerce a writing entry into an add-only dict. UPDATE entries are rejected.
+
+    Primary schema: ``observation_update`` is a list[str] — each string is one
+    atomic fact and the index is auto-assigned. Dict entries are still accepted
+    for backward compatibility but must have ``action == "add"``.
+    """
     if isinstance(update, str):
         stripped = update.strip()
         if not stripped:
             return None
         m_add = _ADD_RE.match(stripped)
-        m_upd = _UPDATE_RE.match(stripped)
         if m_add:
             return {
                 "action": "add",
                 "observation_index": int(m_add.group(1)),
                 "observation": m_add.group(2).strip(),
             }
-        if m_upd:
-            return {
-                "action": "update",
-                "observation_index": int(m_upd.group(1)),
-                "observation": m_upd.group(2).strip(),
-            }
+        # Bare content → treat as add with auto-assigned index
         return {"action": "add", "observation_index": -1, "observation": stripped}
 
     if not isinstance(update, dict):
         return None
 
     action = str(update.get("action", "add")).lower()
-    if action not in {"add", "update"}:
-        action = "add"
+    if action != "add":
+        return None  # RRG v2 disallows update
 
     raw_index = update.get("observation_index", update.get("index", -1))
     try:
@@ -182,7 +191,7 @@ def _normalize_update(update: Any) -> dict[str, Any] | None:
         return None
 
     return {
-        "action": action,
+        "action": "add",
         "observation_index": observation_index,
         "observation": observation,
     }
@@ -202,16 +211,12 @@ def _parse_json_output(text: str) -> RRGParseResult | None:
         return None
 
     result = RRGParseResult()
-    result.citation_span = _find_json_field_value_span(text, "observation_citation", object_start, object_end)
     result.reasoning_span = _find_json_field_value_span(text, "action_reasoning", object_start, object_end)
     result.writing_span = _find_json_field_value_span(text, "observation_update", object_start, object_end)
 
-    citation_value = payload.get("observation_citation", payload.get("fact_citation", []))
     reasoning_value = payload.get("action_reasoning", payload.get("reasoning", ""))
     writing_value = payload.get("observation_update", payload.get("fact_writing", []))
 
-    result.citation_indices = _coerce_int_list(citation_value)
-    result.citation_text = json.dumps(citation_value, ensure_ascii=False)
     result.reasoning_text = "" if reasoning_value is None else str(reasoning_value).strip()
     result.writing_text = json.dumps(writing_value, ensure_ascii=False)
 
@@ -229,10 +234,11 @@ def _parse_json_output(text: str) -> RRGParseResult | None:
 
 
 def parse_rrg_output(text: str) -> RRGParseResult:
-    """Parse a model generation into citation, reasoning, and writing spans.
+    """Parse a model generation into reasoning and writing spans.
 
     Supports the current JSON schema and the legacy section format.
     Tolerates missing sections — any absent section gets empty defaults.
+    Citations are no longer parsed. UPDATE writing ops are rejected.
     """
     json_result = _parse_json_output(text)
     if json_result is not None:
@@ -258,25 +264,10 @@ def parse_rrg_output(text: str) -> RRGParseResult:
         body_end = headers[i + 1][1] if i + 1 < len(headers) else len(text)
         body = text[body_start:body_end].strip()
 
-        if "citation" in name:
-            sections["citation"] = (_hdr_start, body_end, body)
-        elif "reasoning" in name:
+        if "reasoning" in name:
             sections["reasoning"] = (_hdr_start, body_end, body)
         elif "writing" in name:
             sections["writing"] = (_hdr_start, body_end, body)
-
-    # Citation
-    if "citation" in sections:
-        span_start, span_end, body = sections["citation"]
-        result.citation_text = body
-        result.citation_span = (span_start, span_end)
-        m = _CITE_INDICES_RE.search(body)
-        if m:
-            idx_str = m.group(1).strip()
-            if idx_str:
-                result.citation_indices = [
-                    int(x.strip()) for x in idx_str.split(",") if x.strip().isdigit()
-                ]
 
     # Reasoning
     if "reasoning" in sections:
@@ -284,7 +275,7 @@ def parse_rrg_output(text: str) -> RRGParseResult:
         result.reasoning_text = body
         result.reasoning_span = (span_start, span_end)
 
-    # Writing
+    # Writing (add-only)
     if "writing" in sections:
         span_start, span_end, body = sections["writing"]
         result.writing_text = body
@@ -292,24 +283,17 @@ def parse_rrg_output(text: str) -> RRGParseResult:
         for line in body.splitlines():
             line = line.strip().lstrip("-•* ")
             m_add = _ADD_RE.match(line)
-            m_upd = _UPDATE_RE.match(line)
             if m_add:
                 result.writing_updates.append({
                     "action": "add",
                     "observation_index": int(m_add.group(1)),
                     "observation": m_add.group(2).strip(),
                 })
-            elif m_upd:
-                result.writing_updates.append({
-                    "action": "update",
-                    "observation_index": int(m_upd.group(1)),
-                    "observation": m_upd.group(2).strip(),
-                })
             elif line:
-                # Bare line without ADD/UPDATE prefix — treat as add
+                # Bare line — treat as add with auto-assigned index
                 result.writing_updates.append({
                     "action": "add",
-                    "observation_index": -1,  # auto-assign
+                    "observation_index": -1,
                     "observation": line,
                 })
 
@@ -339,7 +323,7 @@ def build_span_masks(
     response_ids: torch.Tensor,
     tokenizer,
 ) -> dict[str, torch.Tensor]:
-    """Build boolean masks for citation, reasoning, and writing token spans.
+    """Build boolean masks for reasoning and fact (writing) token spans.
 
     Args:
         response_text: Decoded response string.
@@ -347,8 +331,8 @@ def build_span_masks(
         tokenizer: HuggingFace tokenizer with ``encode`` method.
 
     Returns:
-        Dict with keys ``cite_mask``, ``reasoning_mask``, ``write_mask``,
-        each a bool tensor of shape ``(response_length,)``.
+        Dict with keys ``reasoning_mask`` and ``fact_mask``, each a bool
+        tensor of shape ``(response_length,)``.
     """
     parse_result = parse_rrg_output(response_text)
     response_length = response_ids.shape[0]
@@ -358,11 +342,10 @@ def build_span_masks(
     offsets = encoding.get("offset_mapping", None)
 
     if offsets is None or len(offsets) == 0:
-        # Fallback: uniform mask (all reasoning)
+        # Fallback: all tokens treated as reasoning, no fact tokens
         return {
-            "cite_mask": torch.zeros(response_length, dtype=torch.bool),
             "reasoning_mask": torch.ones(response_length, dtype=torch.bool),
-            "write_mask": torch.zeros(response_length, dtype=torch.bool),
+            "fact_mask": torch.zeros(response_length, dtype=torch.bool),
         }
 
     # Align offsets to response_length (may differ due to special tokens or truncation)
@@ -371,9 +354,8 @@ def build_span_masks(
     elif len(offsets) < response_length:
         offsets = offsets + [(0, 0)] * (response_length - len(offsets))
 
-    cite_mask = _char_to_token_mask(response_text, *parse_result.citation_span, offsets)
     reasoning_mask = _char_to_token_mask(response_text, *parse_result.reasoning_span, offsets)
-    write_mask = _char_to_token_mask(response_text, *parse_result.writing_span, offsets)
+    fact_mask = _char_to_token_mask(response_text, *parse_result.writing_span, offsets)
 
     def to_tensor(mask: list[bool]) -> torch.Tensor:
         t = torch.tensor(mask, dtype=torch.bool)
@@ -384,7 +366,6 @@ def build_span_masks(
         return t
 
     return {
-        "cite_mask": to_tensor(cite_mask),
         "reasoning_mask": to_tensor(reasoning_mask),
-        "write_mask": to_tensor(write_mask),
+        "fact_mask": to_tensor(fact_mask),
     }

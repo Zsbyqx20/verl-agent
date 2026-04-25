@@ -1,8 +1,13 @@
 """RRG advantage estimator with span-masked, group-normalized advantages.
 
-The design parallels ``gigpo/core_gigpo.py``'s group normalization but adds
-span-level masking so that citation tokens, writing tokens, and reasoning
-tokens receive different advantage signals.
+RRG v2: two span types (reasoning, fact). Three reward signals:
+    - fact_rewards:  per-step scalar, already token-discounted.
+    - reason_rewards: per-step scalar from rank judge, in [-1, 1].
+    - final_rewards: per-trajectory (can_conclude binary) broadcast to all
+      siblings of the trajectory before group normalization.
+
+Tokens in the fact span receive w_fact * A_fact + w_final * A_final.
+Tokens in the reasoning span receive w_reason * A_reason (no A_final).
 """
 from __future__ import annotations
 
@@ -10,10 +15,6 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-
-# ------------------------------------------------------------------ #
-# Group normalization (mirrors gigpo/core_gigpo.py:episode_norm_reward)
-# ------------------------------------------------------------------ #
 
 
 def _group_normalize(
@@ -24,18 +25,10 @@ def _group_normalize(
 ) -> torch.Tensor:
     """Group-normalize scalar scores across rollouts sharing the same ``index``.
 
-    Args:
-        scores: ``(bs,)`` scalar per sample.
-        index: ``(bs,)`` group IDs (samples with the same ID form a group).
-        epsilon: numerical stability term.
-        remove_std: if True, only subtract mean (Dr.GRPO style); if False,
-            also divide by std (original GRPO style).
-
-    Returns:
-        Normalized scores ``(bs,)``.
+    Mirrors ``gigpo/core_gigpo.py:episode_norm_reward``: mean-center by default
+    (Dr.GRPO style); if ``remove_std=False``, also divide by std.
     """
     id2scores: dict[str, list[torch.Tensor]] = defaultdict(list)
-
     bsz = scores.shape[0]
     with torch.no_grad():
         for i in range(bsz):
@@ -64,62 +57,43 @@ def _group_normalize(
     return out
 
 
-# ------------------------------------------------------------------ #
-# Main entry point
-# ------------------------------------------------------------------ #
-
 def compute_rrg_advantage(
-    token_level_rewards: torch.Tensor,   # (bs, response_length) — combined scalar
+    token_level_rewards: torch.Tensor,   # (bs, response_length) — combined scalar, unused but kept for API parity
     response_mask: torch.Tensor,         # (bs, response_length)
-    index: np.ndarray,                   # (bs,) — step-group uid for normalization
-    cite_rewards: np.ndarray,            # (bs,) — R_cite per step
-    write_rewards: np.ndarray,           # (bs,) — R_write per step
-    cite_masks: torch.Tensor,            # (bs, response_length) — bool
-    write_masks: torch.Tensor,           # (bs, response_length) — bool
-    w_cite: float = 1.0,
-    w_write: float = 1.0,
-    w_final: float = 0.0,
-    final_rewards: np.ndarray | None = None,   # (bs,) — R_final per step (trajectory-level)
-    traj_index: np.ndarray | None = None,      # (bs,) — traj_uid for trajectory-level grouping
+    index: np.ndarray,                   # (bs,) — step-group uid (e.g. f"{uid}_{step_t}")
+    traj_index: np.ndarray,              # (bs,) — sibling-rollout group uid for final reward normalization
+    fact_rewards: np.ndarray,            # (bs,) — r_fact per step (already token-discounted)
+    reason_rewards: np.ndarray,          # (bs,) — r_reason per step in [-1, 1]
+    final_rewards: np.ndarray,           # (bs,) — r_final per trajectory (broadcast across all steps of that trajectory)
+    fact_masks: torch.Tensor,            # (bs, response_length) — bool
+    reason_masks: torch.Tensor,          # (bs, response_length) — bool
+    w_fact: float = 1.0,
+    w_reason: float = 1.0,
+    w_final: float = 1.0,
     epsilon: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute span-masked advantages for RRG.
+    """Compute span-masked advantages for RRG v2.
 
-    1. Group-normalize cite and write rewards across rollouts of the same
-       source trajectory.
-    2. Broadcast to token level via span masks.
-    3. Combine into final ``(bs, response_length)`` advantages.
-
-    Returns:
-        ``(advantages, returns)`` both of shape ``(bs, response_length)``.
+    Returns ``(advantages, returns)`` both shape ``(bs, response_length)``.
     """
     device = token_level_rewards.device
-    bsz, response_length = token_level_rewards.shape
 
-    cite_rewards_t = torch.tensor(cite_rewards, dtype=torch.float32, device=device)
-    write_rewards_t = torch.tensor(write_rewards, dtype=torch.float32, device=device)
+    fact_t = torch.tensor(fact_rewards, dtype=torch.float32, device=device)
+    reason_t = torch.tensor(reason_rewards, dtype=torch.float32, device=device)
+    final_t = torch.tensor(final_rewards, dtype=torch.float32, device=device)
 
-    # Group normalize each signal
-    a_cite = _group_normalize(cite_rewards_t, index, epsilon, remove_std=True)
-    a_write = _group_normalize(write_rewards_t, index, epsilon, remove_std=True)
+    a_fact = _group_normalize(fact_t, index, epsilon, remove_std=True)
+    a_reason = _group_normalize(reason_t, index, epsilon, remove_std=True)
+    a_final = _group_normalize(final_t, traj_index, epsilon, remove_std=True)
 
-    # Broadcast to token level via span masks
-    cite_masks_f = cite_masks.float().to(device)
-    write_masks_f = write_masks.float().to(device)
+    fact_mask_f = fact_masks.float().to(device)
+    reason_mask_f = reason_masks.float().to(device)
 
     advantages = (
-        w_cite * a_cite.unsqueeze(-1) * cite_masks_f
-        + w_write * a_write.unsqueeze(-1) * write_masks_f
+        w_fact * a_fact.unsqueeze(-1) * fact_mask_f
+        + w_reason * a_reason.unsqueeze(-1) * reason_mask_f
+        + w_final * a_final.unsqueeze(-1) * fact_mask_f
     )
-
-    # Trajectory-level final reward: broadcast A_final to all cite + write tokens
-    if w_final != 0.0 and final_rewards is not None and traj_index is not None:
-        final_rewards_t = torch.tensor(final_rewards, dtype=torch.float32, device=device)
-        a_final = _group_normalize(final_rewards_t, traj_index, epsilon, remove_std=True)
-        active_span = (cite_masks_f + write_masks_f).clamp(max=1.0)
-        advantages = advantages + w_final * a_final.unsqueeze(-1) * active_span
-
-    # Apply response mask
     advantages = advantages * response_mask
 
     return advantages, advantages

@@ -253,23 +253,31 @@ algorithm:
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
   rrg:
-    # Citation reward weights
-    alpha_prec: 0.4
-    alpha_rec: 0.4
-    alpha_rep: 0.2
-    # Fact quality weights
-    lambda_use: 0.4
-    lambda_val: 0.2
-    lambda_atom: 0.2
-    lambda_gran: 0.2
-    gamma_discount: 0.9
-    update_bonus_scale: 0.5
-    # Advantage combination weights
-    w_cite: 1.0
-    w_write: 1.0
-    w_final: 0.0  # phase 2: trajectory-level J_final
-    # Judge configuration
-    judge_model: "doubao-seed-2-0-pro-260215"
+    # Per-step fact reward:
+    #   useful  → +1 / (1 + fact_tokens / token_scale)
+    #   not useful → −alpha_fact_penalty · (fact_tokens / token_scale)
+    # token_scale calibrated for the list[str] schema (~6–10 tokens per fact).
+    token_scale: 16.0
+    # Penalty for written-but-not-useful fact tokens. Without this, "write
+    # nothing" and "write useless facts" both give r_fact = 0, collapsing the
+    # writer to empty.
+    alpha_fact_penalty: 0.2
+    # Bonus given to silent steps (num_facts == 0) when the trajectory's
+    # final judge returns can_conclude=True. Rewards correct restraint
+    # absolutely, not just relative to peers via group-norm. Keep small so
+    # it does not dominate the useful-fact-write reward (~0.5–0.95).
+    silent_step_bonus: 0.1
+    # Linear length penalty subtracted from r_reason (regardless of rank):
+    #   r_reason = rank_reward − reason_length_penalty · reason_tokens / response_length
+    # Caps unbounded reasoning growth that the rank judge alone can't suppress.
+    reason_length_penalty: 0.3
+    # Advantage composition weights
+    w_fact: 1.0
+    w_reason: 1.0
+    w_final: 1.0
+    # Judge configuration (final + rank judges can share a model)
+    final_judge_model: "doubao-seed-2-0-pro-260215"
+    rank_judge_model: "doubao-seed-2-0-pro-260215"
     judge_base_url: null  # defaults to OPENAI_BASE_URL env var
     max_retries: 3
     max_judge_workers: 16

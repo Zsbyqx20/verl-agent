@@ -1,3 +1,8 @@
+.agents/
+.claude/
+presentation/
+.codex
+skills-lock.json
 
 **/*.pt
 **/checkpoints

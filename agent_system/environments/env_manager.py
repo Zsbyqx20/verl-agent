@@ -13,18 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Tuple, Dict, Union, Any
-from collections import defaultdict
-import torch
-import numpy as np
-from functools import partial
-import os
 import json
-from agent_system.environments.prompts import *
-from agent_system.environments.base import EnvironmentManagerBase, to_numpy
-from agent_system.memory import SimpleMemory, SearchMemory
-from agent_system.memory.fact_bank import FactBankMemory
+import os
+from functools import partial
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
 from omegaconf import OmegaConf
+
+from agent_system.environments.base import EnvironmentManagerBase, to_numpy
+from agent_system.environments.prompts import *
+from agent_system.memory import SearchMemory, SimpleMemory
+from agent_system.memory.fact_bank import FactBankMemory
+
 
 def parse_gamefile(infos):
     gamefile = []
@@ -34,6 +35,7 @@ def parse_gamefile(infos):
         else:
             gamefile.append(None)
     return gamefile
+
 
 def set_gamefile(infos, gamefile):
     for i in range(len(infos)):
@@ -117,7 +119,6 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
 
         return postprocess_text_obs
 
-
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
         # Find the last entry with active masks
         for i in reversed(range(len(total_batch_list[batch_idx]))):
@@ -141,7 +142,7 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         text_obs, image_obs, infos = self.envs.reset()
         self.gamefile = parse_gamefile(infos)
         # initialize the history buffer
-        self.memory.reset(batch_size = len(text_obs))
+        self.memory.reset(batch_size=len(text_obs))
         self.tasks = []
         self.pre_text_obs = text_obs
         self.extract_task(text_obs)
@@ -178,7 +179,6 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             else:
                 raise ValueError("Task description not found in text observation.")
         
-
     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
         """
         This function builds the text observation for the agent.
@@ -252,6 +252,7 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
         3: "Left",
         4: "Right",
     }
+
     def __init__(self, envs, projection_f, config):
         self.is_multi_modal = envs.mode == 'rgb_array'
         self.memory = SimpleMemory()
@@ -264,7 +265,7 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
             self.pre_text_obs = self.envs.render(mode='tiny_rgb_array')
             observations = {
                 'text': self.build_text_obs(infos, init=True), 
-                'image': obs,   
+                'image': obs, 
                 'anchor': obs
             }
         else:
@@ -274,7 +275,7 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
                 'image': None,
                 'anchor': obs
             }
-        self.memory.reset(batch_size = len(infos))
+        self.memory.reset(batch_size=len(infos))
         return observations, infos
 
     def step(self, text_actions: List[str]):
@@ -290,14 +291,14 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
             next_obs = np.array(next_obs, next_obs[0].dtype)
             self.pre_text_obs = self.envs.render(mode='tiny_rgb_array')
             next_observations = {
-                'text': self.build_text_obs(infos),  
+                'text': self.build_text_obs(infos), 
                 'image': next_obs,
                 'anchor': next_obs 
             }
         else:
             self.pre_text_obs = next_obs
             next_observations = {
-                'text': self.build_text_obs(infos, next_obs),  
+                'text': self.build_text_obs(infos, next_obs), 
                 'image': None, 
                 'anchor': next_obs 
             }
@@ -307,7 +308,7 @@ class SokobanEnvironmentManager(EnvironmentManagerBase):
 
         return next_observations, rewards, dones, infos
 
-    def build_text_obs(self, infos, text_obs: List[str]=None, init: bool = False) -> List[str]:
+    def build_text_obs(self, infos, text_obs: List[str] = None, init: bool = False) -> List[str]:
         """
         This function builds the text observation for the agent.
         """
@@ -361,8 +362,7 @@ class GymCardEnvironmentManager(EnvironmentManagerBase):
 
         return next_observations, rewards, dones, infos
 
-
-    def build_text_obs(self, infos: Tuple[Dict]=None) -> List[str]:
+    def build_text_obs(self, infos: Tuple[Dict] = None) -> List[str]:
         """
         This function builds the text observation for the agent.
         """
@@ -399,7 +399,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                         'anchor': obs.copy()
                         }
         self.pre_text_obs = obs
-        self.memory.reset(batch_size = len(infos))
+        self.memory.reset(batch_size=len(infos))
         return observations, infos
 
     def step(self, text_actions: List[str]):
@@ -429,7 +429,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
         tasks = []
         for obs in text_obs:
             parts = obs.split(" [SEP] ")
-            assert parts[1]=='Instruction:'
+            assert parts[1] == 'Instruction:'
             tasks.append(parts[2])
         return tasks
     
@@ -440,7 +440,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
             # the index of self.tasks[i] in parts
             try:
                 index = parts.index(self.tasks[i])
-                reformatted_obs = " [SEP] ".join(f"'{p}'" for p in parts[index+1:])
+                reformatted_obs = " [SEP] ".join(f"'{p}'" for p in parts[index + 1:])
             except:
                 reformatted_obs = text_obs[i]
 
@@ -518,6 +518,7 @@ class WebshopEnvironmentManager(EnvironmentManagerBase):
                 success['webshop_task_score (not success_rate)'].append(score_value)
                 return
 
+
 class AppWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
@@ -527,7 +528,7 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
         text_obs, infos = self.envs.reset()
         
         self.supervisors = [info['supervisor'] for info in infos]
-        self.memory.reset(batch_size = len(text_obs))
+        self.memory.reset(batch_size=len(text_obs))
         self.tasks = text_obs.copy()
         self.pre_text_obs = text_obs
 
@@ -554,7 +555,6 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
 
         return next_observations, rewards, dones, infos
     
-
     def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
         """
         This function builds the text observation for the agent.
@@ -601,6 +601,7 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+
 class RRGEnvironmentManager(EnvironmentManagerBase):
     """Environment manager for the Reverse Reasoning Generator.
 
@@ -622,14 +623,18 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
         self._debug_log_file = rrg_cfg.get("debug_log_file", None)
         super().__init__(envs, projection_f, config)
 
-    def _log_debug(self, event: str, payload: dict):
+    def _log_debug(self, event: str, payload: dict, file_overrides: dict | None = None):
+        # ``payload`` is printed (kept compact for terminal). ``file_overrides``
+        # keys overwrite into the JSONL payload so on-disk records keep full
+        # untruncated content for downstream analysis.
         if not self._debug_log:
             return
-        message = {"event": event, **payload}
-        print(f"[RRG][env] {json.dumps(message, ensure_ascii=False, default=str)}")
+        print_message = {"event": event, **payload}
+        print(f"[RRG][env] {json.dumps(print_message, ensure_ascii=False, default=str)}")
         if self._debug_log_file:
+            file_message = {"source": "env", "event": event, **payload, **(file_overrides or {})}
             with open(self._debug_log_file, "a") as f:
-                f.write(json.dumps({"source": "env", **message}, ensure_ascii=False, default=str) + "\n")
+                f.write(json.dumps(file_message, ensure_ascii=False, default=str) + "\n")
 
     def reset(self, kwargs):
         from agent_system.environments.prompts.rrg import RRG_SYSTEM_PROMPT
@@ -664,7 +669,7 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
 
     def step(self, text_actions: List[str]):
         from agent_system.environments.prompts.rrg import RRG_SYSTEM_PROMPT
-        from rrg.output_parser import parse_rrg_output
+        from rrg.output_parser import parse_rrg_output, sanitize_for_prompt
 
         actions, valids = self.projection_f(text_actions)
         batch_size = len(text_actions)
@@ -674,48 +679,56 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
         # phantom metadata entries that would waste LLM judge calls in the reward manager.
         all_updates = []
         all_reasoning = []
-        all_cited = []
         all_writing_updates = []
         obs_before_snapshots = []  # bank state before this step's writes
         for i in range(batch_size):
-            # Snapshot before update — used by J_fact / J_cite judges
             obs_before_snapshots.append(list(self.memory.get_bank(i)))
 
             parse_result = parse_rrg_output(text_actions[i])
-            all_cited.append(parse_result.citation_indices)
-            all_reasoning.append(parse_result.reasoning_text)
-            all_writing_updates.append(parse_result.writing_updates)
+            # Sanitize model-authored strings BEFORE they re-enter the prompt
+            # at the next step (via reasoning history / fact bank). Without
+            # this, a model that emits literal `<image>` etc. will desync the
+            # vision placeholder count from image_grid_thw and crash the
+            # rollout's preprocess_single_sample.
+            sanitized_reasoning = sanitize_for_prompt(parse_result.reasoning_text)
+            sanitized_updates = []
+            for upd in parse_result.writing_updates:
+                clean = dict(upd)
+                clean["observation"] = sanitize_for_prompt(upd.get("observation", ""))
+                if clean["observation"]:
+                    sanitized_updates.append(clean)
+            all_reasoning.append(sanitized_reasoning)
+            all_writing_updates.append(sanitized_updates)
 
             if self._is_done[i]:
                 all_updates.append([])
                 continue
 
-            # Update fact bank and reasoning history
-            updates = parse_result.writing_updates
-            all_updates.append(updates)
-            self.memory.apply_updates(i, updates, self._current_step[i])
-            self.reasoning_memory[i].append(parse_result.reasoning_text)
+            # Update fact bank (add-only) and reasoning history
+            all_updates.append(sanitized_updates)
+            self.memory.apply_updates(i, sanitized_updates, self._current_step[i])
+            self.reasoning_memory[i].append(sanitized_reasoning)
 
         if self._debug_log:
-            parse_examples = []
+            parse_examples_print = []
+            parse_examples_full = []
             for i in range(min(batch_size, self._debug_log_samples)):
-                parse_examples.append({
+                base = {
                     "env_slot": i,
                     "step_index": self._current_step[i],
-                    "cited_indices": all_cited[i],
                     "num_writes": len(all_writing_updates[i]),
                     "reasoning_chars": len(all_reasoning[i]),
                     "bank_size_before": len(obs_before_snapshots[i]),
                     "bank_size_after": len(self.memory.get_bank(i)),
-                    "output_prefix": text_actions[i][:300],
-                })
+                }
+                parse_examples_print.append({**base, "output_prefix": text_actions[i][:300]})
+                parse_examples_full.append({**base, "output": text_actions[i]})
             self._log_debug("step_parse", {
                 "batch_size": batch_size,
-                "num_outputs_with_citations": sum(1 for cited in all_cited if cited),
                 "num_outputs_with_writes": sum(1 for writes in all_writing_updates if writes),
                 "total_writes": sum(len(writes) for writes in all_writing_updates),
-                "examples": parse_examples,
-            })
+                "examples": parse_examples_print,
+            }, file_overrides={"examples": parse_examples_full})
 
         # Step the replay environment
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
@@ -728,16 +741,26 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
             key = str(i)
             if key not in self.step_metadata:
                 self.step_metadata[key] = []
-            self.step_metadata[key].append({
+            step_entry = {
                 "task": self._tasks[i],
                 "step_index": self._current_step[i],
                 "screenshot_path": infos[i].get("screenshot_path", ""),
+                # AFTER-action screenshot at this step. Empty string for the
+                # final step (trajectory ended; no after-image). J_rank uses
+                # this for action-effect fact-checking (BEFORE remains the
+                # source of correctness).
+                "next_screenshot_path": infos[i].get("next_screenshot_path", ""),
                 "ground_truth_action": infos[i].get("ground_truth_action", ""),
                 "observations_before": obs_before_snapshots[i],
-                "cited_indices": all_cited[i],
                 "writing_updates": all_writing_updates[i],
+                "reasoning_text": all_reasoning[i],
                 "model_output": text_actions[i],
-            })
+            }
+            # If this step terminates the trajectory, stamp the final fact bank
+            # (post-write) for the trajectory-end judge.
+            if bool(dones[i]):
+                step_entry["final_fact_bank"] = list(self.memory.get_bank(i))
+            self.step_metadata[key].append(step_entry)
 
         # Update done flags and step counters for active envs only.
         for i in range(batch_size):
@@ -765,7 +788,7 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
         return next_observations, rewards, dones, infos
 
     def build_text_obs(self, text_obs: List[str], infos: List[dict], init: bool = False) -> List[str]:
-        from agent_system.environments.prompts.rrg import RRG_TEMPLATE_INIT, RRG_TEMPLATE, _AFTER_ACTION_SECTION
+        from agent_system.environments.prompts.rrg import _AFTER_ACTION_SECTION, RRG_TEMPLATE, RRG_TEMPLATE_INIT
 
         postprocess_text_obs = []
         batch_size = len(text_obs)
@@ -841,7 +864,7 @@ def make_envs(config):
         val_envs = GymCardEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     elif "alfworld" in config.env.env_name.lower():
-        from agent_system.environments.env_package.alfworld import build_alfworld_envs, alfworld_projection
+        from agent_system.environments.env_package.alfworld import alfworld_projection, build_alfworld_envs
         if config.env.env_name == 'alfworld/AlfredThorEnv':
             alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
         elif config.env.env_name == 'alfworld/AlfredTWEnv':
@@ -850,7 +873,7 @@ def make_envs(config):
             raise ValueError(f"Unsupported environment: {config.env.env_name}")
 
         env_kwargs = {
-            'eval_dataset': config.env.alfworld.eval_dataset, # 'eval_in_distribution' or 'eval_out_of_distribution'
+            'eval_dataset': config.env.alfworld.eval_dataset,  # 'eval_in_distribution' or 'eval_out_of_distribution'
         }
         _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
         _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
@@ -896,12 +919,12 @@ def make_envs(config):
         envs = WebshopEnvironmentManager(_envs, projection_f, config)
         val_envs = WebshopEnvironmentManager(_val_envs, projection_f, config)
         import time
-        time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1) # wait for the envs to be ready
+        time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1)  # wait for the envs to be ready
         return envs, val_envs
     elif "appworld" in config.env.env_name.lower():
-        from agent_system.environments.env_package.appworld import build_appworld_envs, appworld_projection
+        from agent_system.environments.env_package.appworld import appworld_projection, build_appworld_envs
         _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker)
-        _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n, resources_per_worker=resources_per_worker)
+        _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size * group_n, resources_per_worker=resources_per_worker)
 
         projection_f = partial(appworld_projection)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)

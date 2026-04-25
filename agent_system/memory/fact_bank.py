@@ -93,30 +93,33 @@ class FactBankMemory(BaseMemory):
     def apply_updates(
         self, env_idx: int, updates: list[dict[str, Any]], step: int
     ) -> None:
-        """Apply a list of add/update operations to one environment's bank."""
+        """Apply a list of add operations to one environment's bank.
+
+        RRG v2 is add-only: UPDATE operations are silently dropped to guard
+        against upstream regressions; the parser is the primary gate.
+        """
         assert self._banks is not None
         bank = self._banks[env_idx]
         for upd in updates:
             action = upd.get("action", "add")
+            if action != "add":
+                continue  # RRG v2: add-only
             obs_index = upd.get("observation_index", -1)
             content = upd.get("observation", "")
             if not content:
                 continue
 
-            version = FactVersion(step_written=step, content=content, action=action)
+            version = FactVersion(step_written=step, content=content, action="add")
 
-            if action == "add":
-                if obs_index < 0 or obs_index > len(bank):
-                    obs_index = len(bank)
-                if obs_index == len(bank):
-                    bank.append(FactSlot(versions=[version]))
-                else:
-                    # Treat add to existing index as update
-                    bank[obs_index].versions.append(version)
-            elif action == "update":
-                if 0 <= obs_index < len(bank):
-                    bank[obs_index].versions.append(version)
-                # Silently ignore invalid update indices
+            # Auto-assign index if missing or out of range; always append to the
+            # end so the bank grows monotonically.
+            if obs_index < 0 or obs_index > len(bank):
+                obs_index = len(bank)
+            if obs_index == len(bank):
+                bank.append(FactSlot(versions=[version]))
+            else:
+                # Add-to-existing-index: ignore to preserve add-only semantics.
+                continue
 
     def get_bank(self, env_idx: int) -> list[str]:
         """Return current fact contents as a plain list of strings."""

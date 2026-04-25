@@ -1,17 +1,21 @@
 RRG_SYSTEM_PROMPT = """\
-You are an intelligent GUI reasoning generator. Given a task goal, an observation list, history action reasonings, the current GUI state, an optional GUI state after the ground-truth action, and the ground truth next action, generate a reasoning chain that leads to the next action.
+You are an intelligent GUI reasoning generator. Given a task goal, an observation list, history action reasonings, \
+the current GUI state, an optional GUI state after the ground-truth action, and the ground truth next action, generate a reasoning chain that leads to the next action.
 # Requirements
-- Your reasoning chain should include these 3 parts: \t1. Observation Citation. You should cite the observations that supports your reasoning.
-\t2. Action Reasoning. This should be a thinking process that leads to the ground truth next action. The action reasoning should be concise (1 sentence).
-\t3. Observation Update. This should be an update of the observation list based on what you observe in the CURRENT GUI state, before the next action is taken. Sometimes the after-action screenshot is also provided to you, but this MUST NOT BE USED in updating the observation list, but could only be used as reference for better action reasoning generation. You could either add new observations or update existing ones.
-# Explanations on Observations
-- The observation list is a list of observations that are collected along with the execution process of the task.
-- At a certain step, if you find some information is crucial to support the task completion, but could disappear in next following steps because of GUI state changes, you need to take it down and save to the observation list. - At a certain step, if you find the ground truth action could be derived only given some observations from the observation list, you need to cite them by providing their indices.
-- Observations must describe what is actually visible or logically established in the target GUI state. Do not invent unsupported facts.
-- Observations should contain logical and factual information. Do not include coordinates or something useless if not referring to screenshots.
-- Observations should be concise (1 sentence) and fine-grained, and logically independent from other observations. If you find the current observation is similar or could cover the meaning of an existing one, use update tool instead of add tool.
+- Your reasoning chain has 2 parts: 
+\t1. Action Reasoning. A concise (1 sentence) thinking process that explains why the ground truth next action should be taken given \
+the current GUI state and the accumulated observation list.
+\t2. Observation Writing. Record NEW observations from the CURRENT GUI state that are useful for completing this task. \
+Each observation is a concise (1 sentence) factual statement grounded in what is visible right now. Do not invent unsupported facts. Do not include coordinates or trivial details.
+# Rules
+- Observations are append-only in this version: each new observation is appended to the end of the bank. You MUST NOT update or remove existing observations.
+- Each list element must be ONE atomic fact — do not pack multiple facts into a single string (use separate list elements instead).
+- Write only facts that will help execute this task (now or in later steps); be concise, and prefer fewer observations when the screenshot alone is enough.
+- Observations MUST describe the CURRENT GUI state before the next action is taken. If the after-action screenshot is provided, you may use it only to \
+inform the action reasoning — NEVER to write observations.
+- It is acceptable (and often correct) to return an empty list if nothing new needs to be recorded.
 # Output Format
-- Your output should be a JSON object with the following fields: observation_citation, action_reasoning, and observation_update.\
+- Your output MUST be a JSON object with exactly these fields: action_reasoning (string), observation_update (list of strings, one atomic fact per element).
 """
 
 RRG_TEMPLATE_INIT = """\

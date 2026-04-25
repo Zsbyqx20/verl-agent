@@ -47,6 +47,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_rrg_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -361,23 +362,23 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     elif adv_estimator == AdvantageEstimator.RRG:
         from rrg import core_rrg
         _bsz = data.batch['token_level_rewards'].shape[0]
-        rrg_cite_rewards = data.non_tensor_batch.get('rrg_cite_rewards', np.zeros(_bsz))
-        rrg_write_rewards = data.non_tensor_batch.get('rrg_write_rewards', np.zeros(_bsz))
+        rrg_fact_rewards = data.non_tensor_batch.get('rrg_fact_rewards', np.zeros(_bsz))
+        rrg_reason_rewards = data.non_tensor_batch.get('rrg_reason_rewards', np.zeros(_bsz))
         rrg_final_rewards = data.non_tensor_batch.get('rrg_final_rewards', np.ones(_bsz))
-        traj_uid_index = np.array(data.non_tensor_batch.get('traj_uid', np.arange(_bsz)), dtype=object)
+        traj_uid_index = np.array(data.non_tensor_batch.get('uid', np.arange(_bsz)), dtype=object)
         advantages, returns = core_rrg.compute_rrg_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
             response_mask=data.batch['response_mask'],
             index=np.array(data.non_tensor_batch.get('rrg_step_group_uid', data.non_tensor_batch['uid'])),
-            cite_rewards=rrg_cite_rewards,
-            write_rewards=rrg_write_rewards,
-            cite_masks=data.batch.get('rrg_cite_mask', torch.zeros_like(data.batch['response_mask'])),
-            write_masks=data.batch.get('rrg_write_mask', torch.zeros_like(data.batch['response_mask'])),
-            w_cite=kwargs.get('rrg_w_cite', 1.0),
-            w_write=kwargs.get('rrg_w_write', 1.0),
-            w_final=kwargs.get('rrg_w_final', 0.0),
-            final_rewards=rrg_final_rewards,
             traj_index=traj_uid_index,
+            fact_rewards=rrg_fact_rewards,
+            reason_rewards=rrg_reason_rewards,
+            final_rewards=rrg_final_rewards,
+            fact_masks=data.batch.get('rrg_fact_mask', torch.zeros_like(data.batch['response_mask'])),
+            reason_masks=data.batch.get('rrg_reason_mask', torch.zeros_like(data.batch['response_mask'])),
+            w_fact=kwargs.get('rrg_w_fact', 1.0),
+            w_reason=kwargs.get('rrg_w_reason', 1.0),
+            w_final=kwargs.get('rrg_w_final', 1.0),
         )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
@@ -1143,34 +1144,31 @@ class RayPPOTrainer:
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.RRG:
                         from rrg.output_parser import parse_rrg_output, build_span_masks
                         responses = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
-                        cite_masks_list, write_masks_list = [], []
+                        reason_masks_list, fact_masks_list = [], []
                         parse_stats = {
-                            "has_citation_section": 0,
                             "has_reasoning_section": 0,
                             "has_writing_section": 0,
-                            "num_cited_indices": 0,
                             "num_writing_updates": 0,
                         }
                         for i, resp in enumerate(responses):
                             parsed = parse_rrg_output(resp)
-                            parse_stats["has_citation_section"] += int(parsed.citation_span != (0, 0))
                             parse_stats["has_reasoning_section"] += int(parsed.reasoning_span != (0, 0))
                             parse_stats["has_writing_section"] += int(parsed.writing_span != (0, 0))
-                            parse_stats["num_cited_indices"] += len(parsed.citation_indices)
                             parse_stats["num_writing_updates"] += len(parsed.writing_updates)
                             masks = build_span_masks(resp, batch.batch['responses'][i], self.tokenizer)
-                            cite_masks_list.append(masks['cite_mask'])
-                            write_masks_list.append(masks['write_mask'])
-                        batch.batch['rrg_cite_mask'] = torch.stack(cite_masks_list).to(batch.batch['responses'].device)
-                        batch.batch['rrg_write_mask'] = torch.stack(write_masks_list).to(batch.batch['responses'].device)
+                            reason_masks_list.append(masks['reasoning_mask'])
+                            fact_masks_list.append(masks['fact_mask'])
+                        batch.batch['rrg_reason_mask'] = torch.stack(reason_masks_list).to(batch.batch['responses'].device)
+                        batch.batch['rrg_fact_mask'] = torch.stack(fact_masks_list).to(batch.batch['responses'].device)
+                        batch.meta_info['rrg_parse_stats'] = {"batch_size": len(batch), **parse_stats}
                         if self.config.algorithm.rrg.get("debug_log", False):
                             response_mask_for_debug = compute_response_mask(batch)
                             debug_samples = int(self.config.algorithm.rrg.get("debug_log_samples", 3))
                             mask_payload = {
                                 "batch_size": len(batch),
                                 **parse_stats,
-                                "cite_mask_tokens": int(batch.batch['rrg_cite_mask'].sum().item()),
-                                "write_mask_tokens": int(batch.batch['rrg_write_mask'].sum().item()),
+                                "reason_mask_tokens": int(batch.batch['rrg_reason_mask'].sum().item()),
+                                "fact_mask_tokens": int(batch.batch['rrg_fact_mask'].sum().item()),
                                 "response_tokens": int(response_mask_for_debug.sum().item()),
                                 "sample_outputs": responses[:debug_samples],
                             }
@@ -1298,8 +1296,8 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
-                            rrg_w_cite=self.config.algorithm.rrg.w_cite,
-                            rrg_w_write=self.config.algorithm.rrg.w_write,
+                            rrg_w_fact=self.config.algorithm.rrg.w_fact,
+                            rrg_w_reason=self.config.algorithm.rrg.w_reason,
                             rrg_w_final=self.config.algorithm.rrg.w_final,
                         )
 
@@ -1356,6 +1354,8 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if self.config.algorithm.adv_estimator == AdvantageEstimator.RRG:
+                    metrics.update(compute_rrg_metrics(batch=batch))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
