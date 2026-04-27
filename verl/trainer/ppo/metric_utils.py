@@ -259,10 +259,34 @@ def compute_rrg_metrics(batch: DataProto) -> Dict[str, Any]:
         metrics["rrg/judge/rank_failures"] = int(judge_stats.get("rank_failures", 0))
         metrics["rrg/judge/step_calls"] = int(judge_stats.get("step_calls", 0))
         metrics["rrg/judge/step_failures"] = int(judge_stats.get("step_failures", 0))
-        total_calls = metrics["rrg/judge/final_calls"] + metrics["rrg/judge/rank_calls"] + metrics["rrg/judge/step_calls"]
-        total_fails = metrics["rrg/judge/final_failures"] + metrics["rrg/judge/rank_failures"] + metrics["rrg/judge/step_failures"]
+        metrics["rrg/judge/compare_calls"] = int(judge_stats.get("compare_calls", 0))
+        metrics["rrg/judge/compare_failures"] = int(judge_stats.get("compare_failures", 0))
+        total_calls = (
+            metrics["rrg/judge/final_calls"]
+            + metrics["rrg/judge/rank_calls"]
+            + metrics["rrg/judge/step_calls"]
+            + metrics["rrg/judge/compare_calls"]
+        )
+        total_fails = (
+            metrics["rrg/judge/final_failures"]
+            + metrics["rrg/judge/rank_failures"]
+            + metrics["rrg/judge/step_failures"]
+            + metrics["rrg/judge/compare_failures"]
+        )
         if total_calls > 0:
             metrics["rrg/judge/failure_rate"] = total_fails / total_calls
+        # Stage-1 ``is_finished`` rate over total stage-1 calls (failure
+        # branches do not bump ``final_is_finished``, so this reflects actual
+        # judge agreement, not charity defaults).
+        if metrics["rrg/judge/final_calls"] > 0:
+            metrics["rrg/final/is_finished_rate"] = (
+                int(judge_stats.get("final_is_finished", 0)) / metrics["rrg/judge/final_calls"]
+            )
+        # Stage-2 match rate over total stage-2 calls.
+        if metrics["rrg/judge/compare_calls"] > 0:
+            metrics["rrg/judge/compare_match_rate"] = (
+                int(judge_stats.get("compare_matches", 0)) / metrics["rrg/judge/compare_calls"]
+            )
 
         fact_total = int(judge_stats.get("fact_total", 0))
         if fact_total > 0:

@@ -272,10 +272,16 @@ algorithm:
     w_fact: 1.0
     w_reason: 1.0
     w_final: 1.0
-    # Judge configuration (final/step/rank judges can share a model)
+    # Judge configuration (all judges can share a model)
+    # final_judge_model runs stage-1 of the trajectory-end judge: derives a
+    # predicted answer from action reasonings + fact bank + last screenshot.
+    # compare_judge_model runs stage-2 (text-only): semantically compares the
+    # predicted answer against the ground-truth return value. Stage 2 is
+    # skipped for tasks without a return value.
     final_judge_model: "doubao-seed-2-0-pro-260215"
     rank_judge_model: "doubao-seed-2-0-pro-260215"
     step_judge_model: "doubao-seed-2-0-pro-260215"
+    compare_judge_model: "doubao-seed-2-0-pro-260215"
     judge_base_url: null  # defaults to OPENAI_BASE_URL env var
     max_retries: 3
     max_judge_workers: 16

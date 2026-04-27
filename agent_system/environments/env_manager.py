@@ -757,9 +757,13 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                 "model_output": text_actions[i],
             }
             # If this step terminates the trajectory, stamp the final fact bank
-            # (post-write) for the trajectory-end judge.
+            # (post-write) and the ground-truth return value (when present)
+            # for the trajectory-end judge. ``gt_answer`` is None for tasks
+            # without a return value; the reward manager skips stage-2 compare
+            # in that case.
             if bool(dones[i]):
                 step_entry["final_fact_bank"] = list(self.memory.get_bank(i))
+                step_entry["gt_answer"] = infos[i].get("terminate_content", None)
             self.step_metadata[key].append(step_entry)
 
         # Update done flags and step counters for active envs only.

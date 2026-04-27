@@ -3,12 +3,19 @@
 After rollout, this manager computes three per-item reward signals:
     * rrg_fact_rewards:   per-step sum of per-fact rewards from a step-level
                           grounding judge (J_step) plus an additive crucial
-                          bonus from the trajectory-end judge (J_final).
+                          bonus from the stage-1 trajectory-end judge.
                           Per-fact: ungrounded → -r_pen, grounded ∧ trivial → 0,
                           grounded ∧ meaningful → +r_step. Crucial → +r_bonus.
     * rrg_reason_rewards: per-step rank reward in [-1, 1] from a sibling-rank
                           judge over the n rollouts at each source step.
-    * rrg_final_rewards:  per-trajectory binary can-conclude signal.
+    * rrg_final_rewards:  per-trajectory binary success signal. Computed via a
+                          two-stage flow: stage 1 derives a predicted answer
+                          from action reasonings + fact bank + last screenshot
+                          (and emits is_finished + crucial_fact_indices); for
+                          tasks with a ground-truth return value, stage 2
+                          semantically compares predicted vs ground-truth and
+                          returns a single ``matches`` boolean. Final value is
+                          1.0 iff (is_finished AND matches), else 0.0.
 
 The advantage estimator reads these via ``reward_extra_info`` and composes
 token-level advantages using ``rrg_fact_mask`` and ``rrg_reason_mask``.
@@ -47,10 +54,19 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
-class FinalJudgment(BaseModel):  # type: ignore[misc]
+class Stage1FinalJudgment(BaseModel):  # type: ignore[misc]
+    # ``predicted_answer`` mirrors the ANSWER_TEMPLATE shape (dict / list /
+    # nested) when one is provided, or is ``None`` for tasks without a
+    # ground-truth return value. Stage 2 only runs in the former case.
     reasoning: str
-    can_conclude: bool
+    is_finished: bool
+    predicted_answer: Any = None
     crucial_fact_indices: list[int]
+
+
+class CompareJudgment(BaseModel):  # type: ignore[misc]
+    reasoning: str
+    matches: bool
 
 
 class RankJudgment(BaseModel):  # type: ignore[misc]
@@ -72,29 +88,67 @@ class StepJudgment(BaseModel):  # type: ignore[misc]
 # Prompts
 # ---------------------------------------------------------------------------
 
-FINAL_JUDGE_PROMPT = """\
-You are the final validator for a GUI agent reasoning system.
+STAGE1_FINAL_JUDGE_PROMPT = """\
+You are the stage-1 final validator for a GUI agent reasoning system.
 
 You are given:
 - A task goal.
+- The agent's per-step action reasonings across the trajectory (numbered, in
+  chronological order).
+- A numbered observation bank: facts the agent recorded while doing the task.
 - The final GUI screenshot at the moment the agent submits a finish action.
-- A numbered observation bank: facts the agent recorded across the trajectory.
-- The finish action the agent is about to take (JSON).
+- Optionally, an ANSWER_TEMPLATE describing the expected return-value
+  structure with leaf values redacted as the literal string "<fill in>". When
+  an ANSWER_TEMPLATE is provided you must produce a ``predicted_answer`` with
+  the EXACT SAME STRUCTURE (same keys, same list lengths) where each leaf is
+  replaced by the concrete value supported by the trajectory evidence. When
+  no ANSWER_TEMPLATE is provided, return ``predicted_answer`` as null.
 
-Your job has two parts, both based ONLY on the screenshot + the observation bank:
-1. can_conclude: can you conclude that the given finish action is the correct
-   next step for this task? Respond true if the evidence (screenshot + bank)
-   supports the finish action, false otherwise.
-2. crucial_fact_indices: list the observation-bank indices whose information
-   was GENUINELY LOAD-BEARING for reaching can_conclude — facts that, if
-   removed, would make the finish action unsupportable from the final
-   screenshot alone. Be strict and parsimonious: if a fact is interesting but
-   not load-bearing for the conclusion, exclude it. If the final screenshot
-   alone supports the conclusion, return an empty list. This is a sparse
-   bonus signal, not a quality rating — quality is judged elsewhere.
+Produce three things:
+1. is_finished: based on action reasonings + observation bank + final
+   screenshot, has the task been GENUINELY completed? Respond true only if
+   the trajectory evidence supports it; respond false if the agent gave up,
+   stopped early, or the final state does not satisfy the task goal.
+2. predicted_answer: see ANSWER_TEMPLATE rules above. When ANSWER_TEMPLATE is
+   provided, fill in the leaf values from the trajectory evidence (action
+   reasonings, fact bank, final screenshot) — do NOT invent values absent
+   from those inputs. Preserve the template's nested structure exactly.
+3. crucial_fact_indices: list the observation-bank indices whose information
+   was GENUINELY LOAD-BEARING for is_finished — facts that, if removed,
+   would make the conclusion unsupportable from the final screenshot alone.
+   Be strict and parsimonious: if a fact is interesting but not load-bearing
+   for the conclusion, exclude it. If the final screenshot alone supports
+   the conclusion, return an empty list. This is a sparse bonus signal, not a
+   quality rating — quality is judged elsewhere.
 
-Respond with JSON: {"reasoning": "...", "can_conclude": <true|false>, "crucial_fact_indices": [<int>, ...]}.
+Respond with JSON: {"reasoning": "...", "is_finished": <true|false>, "predicted_answer": <object|null>, "crucial_fact_indices": [<int>, ...]}.
 Only include indices that exist in the observation bank.\
+"""
+
+STAGE2_COMPARE_PROMPT = """\
+You are an answer comparator for a GUI agent task. You are given two
+candidate answers for the same task: GROUND_TRUTH (correct, taken from the
+task data) and PREDICTED (the agent's stage-1 output). Decide whether
+PREDICTED matches GROUND_TRUTH SEMANTICALLY — not by surface form.
+
+Treat answers as MATCHING if they convey the same underlying information:
+- Equivalent phrasings of text fields ("$10" vs "10 dollars", "NYC" vs
+  "New York City").
+- Trivial formatting differences (case, whitespace, punctuation, leading
+  articles, currency symbols).
+- For list-typed fields that are inherently set-like (e.g., a set of tags
+  with no obvious ordering), reordering of elements is acceptable.
+
+Treat answers as NOT MATCHING if any field carries different factual
+content:
+- Different numeric values (counts, prices, IDs).
+- Different proper nouns (names, titles) that are not aliases.
+- Missing items in lists where order or count is meaningful, or where the
+  list represents a ranked/ordered output.
+- Predicted contains placeholder strings (e.g. literal "<fill in>") or is
+  empty when ground truth is non-empty.
+
+Return JSON: {"reasoning": "<one short sentence>", "matches": <true|false>}.\
 """
 
 STEP_JUDGE_PROMPT = """\
@@ -228,24 +282,53 @@ def _llm_call_with_retry(fn: Callable[[], _T], max_retries: int) -> _T:
     raise last_exc
 
 
-def call_final_judge(
+def _redact_values(obj: Any) -> Any:
+    """Recursively replace leaf values with the placeholder ``"<fill in>"``.
+
+    Preserves dict / list structure exactly; non-container values become the
+    placeholder string. Used to derive a stage-1 ANSWER_TEMPLATE from a
+    ground-truth answer so the judge sees the schema but not the values.
+    """
+    if isinstance(obj, dict):
+        return {k: _redact_values(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_redact_values(v) for v in obj]
+    return "<fill in>"
+
+
+def call_stage1_final_judge(
     task: str,
-    finish_action: str,
+    action_reasonings: list[str],
     fact_bank: list[str],
     image_path: str,
+    answer_template: Any,
     model: str,
     base_url: str | None,
     max_retries: int,
-) -> FinalJudgment:
+) -> Stage1FinalJudgment:
     bank_text = "empty" if not fact_bank else "\n".join(f"{i}: {obs}" for i, obs in enumerate(fact_bank))
-    user_text = f"Task Goal: {task}\nFinish Action: {finish_action}\nObservation Bank:\n{bank_text}"
+    reasoning_text = "empty" if not action_reasonings else "\n".join(f"{i}: {r}" for i, r in enumerate(action_reasonings))
+    if answer_template is not None:
+        template_text = json.dumps(answer_template, ensure_ascii=False, indent=2)
+        template_block = (
+            "\n\nANSWER_TEMPLATE (fill the redacted leaf values; preserve structure):\n"
+            f"{template_text}"
+        )
+    else:
+        template_block = "\n\nNo ANSWER_TEMPLATE — return predicted_answer as null."
+    user_text = (
+        f"Task Goal: {task}\n"
+        f"Action Reasonings:\n{reasoning_text}\n\n"
+        f"Observation Bank:\n{bank_text}"
+        f"{template_block}"
+    )
 
     def _call():
         client = _get_client(base_url)
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": FINAL_JUDGE_PROMPT},
+                {"role": "system", "content": STAGE1_FINAL_JUDGE_PROMPT},
                 {
                     "role": "user",
                     "content": [
@@ -258,8 +341,43 @@ def call_final_judge(
         )
         content = response.choices[0].message.content
         if not content:
-            raise ValueError("FinalJudgment completion output is empty")
-        return _parse_json_response(content, FinalJudgment)
+            raise ValueError("Stage1FinalJudgment completion output is empty")
+        return _parse_json_response(content, Stage1FinalJudgment)
+
+    return _llm_call_with_retry(_call, max_retries)
+
+
+def call_compare_judge(
+    task: str,
+    gt_answer: Any,
+    predicted_answer: Any,
+    model: str,
+    base_url: str | None,
+    max_retries: int,
+) -> CompareJudgment:
+    gt_text = json.dumps(gt_answer, ensure_ascii=False, indent=2)
+    pred_text = json.dumps(predicted_answer, ensure_ascii=False, indent=2)
+    user_text = (
+        f"Task Goal: {task}\n\n"
+        f"GROUND_TRUTH:\n{gt_text}\n\n"
+        f"PREDICTED:\n{pred_text}"
+    )
+
+    def _call():
+        client = _get_client(base_url)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": STAGE2_COMPARE_PROMPT},
+                {"role": "user", "content": user_text},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("CompareJudgment completion output is empty")
+        return _parse_json_response(content, CompareJudgment)
 
     return _llm_call_with_retry(_call, max_retries)
 
@@ -351,7 +469,7 @@ def call_rank_judge(
 
 
 class RRGRewardManager:
-    """Two-judge reward manager for RRG v2."""
+    """Three-judge reward manager for RRG v3 (stage-1 + stage-2 final, plus J_step and J_rank)."""
 
     def __init__(
         self,
@@ -379,6 +497,7 @@ class RRGRewardManager:
         self.final_judge_model = cfg.get("final_judge_model", "doubao-seed-2-0-pro-260215")
         self.rank_judge_model = cfg.get("rank_judge_model", self.final_judge_model)
         self.step_judge_model = cfg.get("step_judge_model", self.final_judge_model)
+        self.compare_judge_model = cfg.get("compare_judge_model", self.final_judge_model)
         self.judge_base_url = cfg.get("judge_base_url", None)
         self.max_retries = int(cfg.get("max_retries", 3))
         self.max_judge_workers = int(cfg.get("max_judge_workers", 16))
@@ -431,10 +550,19 @@ class RRGRewardManager:
         judge_stats = {
             "final_calls": 0,
             "final_failures": 0,
+            # Stage-1 ``is_finished`` True verdicts (successes only — failure
+            # branches do not bump this counter so the rate metric reflects
+            # actual judge agreement).
+            "final_is_finished": 0,
             "rank_calls": 0,
             "rank_failures": 0,
             "step_calls": 0,
             "step_failures": 0,
+            # Stage-2 compare judge counters. ``compare_calls`` only fires
+            # for trajectories with a ground-truth return value.
+            "compare_calls": 0,
+            "compare_failures": 0,
+            "compare_matches": 0,
             # Fact-quality aggregates over all per-fact judgements in this batch.
             "fact_total": 0,
             "fact_grounded": 0,
@@ -510,64 +638,152 @@ class RRGRewardManager:
         pool = self._get_pool()
 
         # ------------------------------------------------------------------ #
-        # Phase F — Final judge per trajectory                                #
+        # Phase F1 — Stage-1 final judge per trajectory                       #
         # ------------------------------------------------------------------ #
-        all_final_futures: dict[Future, int] = {}
+        # Stage 1 derives ``is_finished`` + ``predicted_answer`` (when a
+        # ground-truth return value exists) + ``crucial_fact_indices`` from
+        # task + ALL action reasonings + final fact bank + last screenshot.
+        stage1_futures: dict[Future, int] = {}
+        # env_slot -> ground-truth answer (None for tasks without a return
+        # value; non-None values gate stage-2 compare). Tracked separately so
+        # the post-stage-1 pass can decide whether to submit stage 2.
+        slot_to_gt: dict[int, Any] = {}
         for env_slot, _ in enumerate(unique_trajs_ordered):
             traj_meta = step_metadata.get(str(env_slot), [])
             if not traj_meta:
                 continue
             last_meta = traj_meta[-1]
             image_path = last_meta.get("screenshot_path", "")
-            raw_action = last_meta.get("ground_truth_action", "")
-            finish_action_str = raw_action if isinstance(raw_action, str) else json.dumps(raw_action)
             fact_bank = last_meta.get("final_fact_bank") or traj_fact_content.get(env_slot, [])
 
+            # Detect return-value tasks. ``gt_answer`` is None when the task
+            # has no return value; an empty container also counts as "no
+            # ground truth" — both skip stage 2.
+            gt_answer = last_meta.get("gt_answer", None)
+            has_gt = gt_answer is not None and (not hasattr(gt_answer, "__len__") or len(gt_answer) > 0)
+            slot_to_gt[env_slot] = gt_answer if has_gt else None
+            answer_template = _redact_values(gt_answer) if has_gt else None
+
+            action_reasonings = [m.get("reasoning_text", "") or "" for m in traj_meta]
+
             if not image_path or not os.path.isfile(image_path):
-                continue  # default: can_conclude=True, useful=all (handled below)
+                continue  # charity default applied below (is_finished=True, matches=True)
 
             fut = pool.submit(
-                call_final_judge,
+                call_stage1_final_judge,
                 last_meta.get("task", ""),
-                finish_action_str,
+                action_reasonings,
                 list(fact_bank),
                 image_path,
+                answer_template,
                 self.final_judge_model,
                 self.judge_base_url,
                 self.max_retries,
             )
-            all_final_futures[fut] = env_slot
+            stage1_futures[fut] = env_slot
             judge_stats["final_calls"] += 1
 
-        final_results: dict[int, tuple[bool, set[int]]] = {}
-        for fut in as_completed(all_final_futures):
-            env_slot = all_final_futures[fut]
+        # Stage-1 results: env_slot -> (is_finished, predicted_answer, crucial_set).
+        stage1_results: dict[int, tuple[bool, Any, set[int]]] = {}
+        for fut in as_completed(stage1_futures):
+            env_slot = stage1_futures[fut]
             try:
                 judgment = fut.result()
                 crucial_set = {int(i) for i in judgment.crucial_fact_indices}
-                final_results[env_slot] = (bool(judgment.can_conclude), crucial_set)
+                stage1_results[env_slot] = (
+                    bool(judgment.is_finished),
+                    judgment.predicted_answer,
+                    crucial_set,
+                )
+                if bool(judgment.is_finished):
+                    judge_stats["final_is_finished"] += 1
                 if self.debug_log:
                     self._log_debug(
-                        "final_judge",
+                        "stage1_final_judge",
                         {
                             "env_slot": env_slot,
-                            "can_conclude": judgment.can_conclude,
+                            "is_finished": judgment.is_finished,
+                            "predicted_answer": judgment.predicted_answer,
                             "crucial": sorted(crucial_set),
                             "reasoning": judgment.reasoning[:300],
                         },
                         file_overrides={"reasoning": judgment.reasoning},
                     )
             except Exception as exc:
-                # Conservative default: can_conclude=True, no crucial facts (avoids false positives)
-                final_results[env_slot] = (True, set())
+                # Charity default: is_finished=True, predicted={}, no crucial.
+                stage1_results[env_slot] = (True, {}, set())
                 judge_stats["final_failures"] += 1
                 self._log_error(
-                    "final_judge_failed",
+                    "stage1_final_judge_failed",
                     {
                         "env_slot": env_slot,
                         "error": repr(exc),
                     },
                 )
+
+        # ------------------------------------------------------------------ #
+        # Phase F2 — Stage-2 compare judge (return-value tasks only)          #
+        # ------------------------------------------------------------------ #
+        # Text-only call: compare predicted_answer (from stage 1) vs
+        # gt_answer semantically; returns a single ``matches`` boolean.
+        # No-return tasks skip this entirely; ``matches`` defaults to True.
+        stage2_futures: dict[Future, int] = {}
+        for env_slot, (_is_finished, predicted_answer, _crucial) in stage1_results.items():
+            gt_answer = slot_to_gt.get(env_slot)
+            if gt_answer is None:
+                continue
+            traj_meta = step_metadata.get(str(env_slot), [])
+            task = traj_meta[-1].get("task", "") if traj_meta else ""
+            fut = pool.submit(
+                call_compare_judge,
+                task,
+                gt_answer,
+                predicted_answer,
+                self.compare_judge_model,
+                self.judge_base_url,
+                self.max_retries,
+            )
+            stage2_futures[fut] = env_slot
+            judge_stats["compare_calls"] += 1
+
+        stage2_matches: dict[int, bool] = {}
+        for fut in as_completed(stage2_futures):
+            env_slot = stage2_futures[fut]
+            try:
+                judgment = fut.result()
+                matches = bool(judgment.matches)
+                stage2_matches[env_slot] = matches
+                if matches:
+                    judge_stats["compare_matches"] += 1
+                if self.debug_log:
+                    self._log_debug(
+                        "stage2_compare_judge",
+                        {
+                            "env_slot": env_slot,
+                            "matches": matches,
+                            "reasoning": judgment.reasoning[:300],
+                        },
+                        file_overrides={"reasoning": judgment.reasoning},
+                    )
+            except Exception as exc:
+                # Charity default: matches=True (do not punish on judge error).
+                stage2_matches[env_slot] = True
+                judge_stats["compare_failures"] += 1
+                self._log_error(
+                    "stage2_compare_judge_failed",
+                    {
+                        "env_slot": env_slot,
+                        "error": repr(exc),
+                    },
+                )
+
+        # Combine stage-1 + stage-2 into final_results: env_slot -> (is_finished, matches, crucial_set).
+        # No-return-value trajectories get matches=True (stage 2 was skipped);
+        # missing slots fall back to (True, True, set()) at the consumer site.
+        final_results: dict[int, tuple[bool, bool, set[int]]] = {}
+        for env_slot, (is_finished, _pred, crucial_set) in stage1_results.items():
+            matches = stage2_matches.get(env_slot, True)
+            final_results[env_slot] = (is_finished, matches, crucial_set)
 
         # ------------------------------------------------------------------ #
         # Phase S — Step judge per (env_slot, step_t) where facts were written #
@@ -760,12 +976,13 @@ class RRGRewardManager:
             uid_of_traj = env_slot_to_uid.get(env_slot, "")
             n_siblings = len(uid_to_slots.get(uid_of_traj, [env_slot])) if uid_of_traj else 1
 
-            # Final reward for this trajectory.
+            # Final reward for this trajectory: 1.0 iff stage-1 is_finished
+            # AND stage-2 matches (matches defaults to True for no-return tasks).
             if env_slot in final_results:
-                can_conclude, crucial_indices = final_results[env_slot]
+                is_finished, matches, crucial_indices = final_results[env_slot]
             else:
-                can_conclude, crucial_indices = True, set()
-            r_final = 1.0 if can_conclude else 0.0
+                is_finished, matches, crucial_indices = True, True, set()
+            r_final = 1.0 if (is_finished and matches) else 0.0
 
             step_fact_idx_map = step_fact_idxs.get(env_slot, {})
 
@@ -879,7 +1096,8 @@ class RRGRewardManager:
                     {
                         "env_slot": env_slot,
                         "n_siblings": n_siblings,
-                        "can_conclude": can_conclude,
+                        "is_finished": is_finished,
+                        "matches": matches,
                         "crucial_count": len(crucial_indices),
                         "total_facts": len(traj_fact_content.get(env_slot, [])),
                         "r_final": r_final,
