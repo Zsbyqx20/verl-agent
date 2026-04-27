@@ -494,6 +494,7 @@ class RRGRewardManager:
         # reason_tokens / response_length, regardless of rank. Caps unbounded
         # reasoning growth that the rank judge alone can't suppress.
         self.reason_length_penalty = float(cfg.get("reason_length_penalty", 0.3))
+        self.w_reason = float(cfg.get("w_reason", 1.0))
         self.final_judge_model = cfg.get("final_judge_model", "doubao-seed-2-0-pro-260215")
         self.rank_judge_model = cfg.get("rank_judge_model", self.final_judge_model)
         self.step_judge_model = cfg.get("step_judge_model", self.final_judge_model)
@@ -871,40 +872,41 @@ class RRGRewardManager:
             env_slot_to_uid[env_slot] = uid_str
 
         all_rank_futures: dict[Future, tuple[str, int, list[int]]] = {}
-        for uid_str, sibling_slots in uid_to_slots.items():
-            if len(sibling_slots) < 2:
-                continue
-            max_t = max(len(step_metadata.get(str(s), [])) for s in sibling_slots)
-            for t in range(max_t):
-                reasonings: list[str] = []
-                valid_slots: list[int] = []
-                for s in sibling_slots:
-                    traj_meta = step_metadata.get(str(s), [])
-                    if t < len(traj_meta):
-                        reasonings.append(traj_meta[t].get("reasoning_text", "") or "")
-                        valid_slots.append(s)
-                if len(valid_slots) < 2:
+        if self.w_reason != 0:
+            for uid_str, sibling_slots in uid_to_slots.items():
+                if len(sibling_slots) < 2:
                     continue
-                first_meta = step_metadata[str(valid_slots[0])][t]
-                image_path = first_meta.get("screenshot_path", "")
-                if not image_path or not os.path.isfile(image_path):
-                    continue
-                # AFTER-action screenshot. Empty/missing on the final step;
-                # call_rank_judge degrades gracefully to single-image mode.
-                next_image_path = first_meta.get("next_screenshot_path", "") or None
-                fut = pool.submit(
-                    call_rank_judge,
-                    first_meta.get("task", ""),
-                    image_path,
-                    next_image_path,
-                    first_meta.get("ground_truth_action", "") if isinstance(first_meta.get("ground_truth_action", ""), str) else json.dumps(first_meta.get("ground_truth_action", "")),
-                    reasonings,
-                    self.rank_judge_model,
-                    self.judge_base_url,
-                    self.max_retries,
-                )
-                all_rank_futures[fut] = (uid_str, t, valid_slots)
-                judge_stats["rank_calls"] += 1
+                max_t = max(len(step_metadata.get(str(s), [])) for s in sibling_slots)
+                for t in range(max_t):
+                    reasonings: list[str] = []
+                    valid_slots: list[int] = []
+                    for s in sibling_slots:
+                        traj_meta = step_metadata.get(str(s), [])
+                        if t < len(traj_meta):
+                            reasonings.append(traj_meta[t].get("reasoning_text", "") or "")
+                            valid_slots.append(s)
+                    if len(valid_slots) < 2:
+                        continue
+                    first_meta = step_metadata[str(valid_slots[0])][t]
+                    image_path = first_meta.get("screenshot_path", "")
+                    if not image_path or not os.path.isfile(image_path):
+                        continue
+                    # AFTER-action screenshot. Empty/missing on the final step;
+                    # call_rank_judge degrades gracefully to single-image mode.
+                    next_image_path = first_meta.get("next_screenshot_path", "") or None
+                    fut = pool.submit(
+                        call_rank_judge,
+                        first_meta.get("task", ""),
+                        image_path,
+                        next_image_path,
+                        first_meta.get("ground_truth_action", "") if isinstance(first_meta.get("ground_truth_action", ""), str) else json.dumps(first_meta.get("ground_truth_action", "")),
+                        reasonings,
+                        self.rank_judge_model,
+                        self.judge_base_url,
+                        self.max_retries,
+                    )
+                    all_rank_futures[fut] = (uid_str, t, valid_slots)
+                    judge_stats["rank_calls"] += 1
 
         # rank_by_slot_step[(env_slot, step_t)] = rank in [0, n-1]; 0 = best.
         rank_by_slot_step: dict[tuple[int, int], float] = {}
