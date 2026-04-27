@@ -253,20 +253,17 @@ algorithm:
     enable_similarity: False # whether to use similarity-based anchor state grouping in GiGPO (supported for text-only tasks)
     similarity_thresh: 0.95 # similarity threshold for GiGPO (0.0, 1.0)
   rrg:
-    # Per-step fact reward:
-    #   useful  → +1 / (1 + fact_tokens / token_scale)
-    #   not useful → −alpha_fact_penalty · (fact_tokens / token_scale)
-    # token_scale calibrated for the list[str] schema (~6–10 tokens per fact).
-    token_scale: 16.0
-    # Penalty for written-but-not-useful fact tokens. Without this, "write
-    # nothing" and "write useless facts" both give r_fact = 0, collapsing the
-    # writer to empty.
-    alpha_fact_penalty: 0.2
-    # Bonus given to silent steps (num_facts == 0) when the trajectory's
-    # final judge returns can_conclude=True. Rewards correct restraint
-    # absolutely, not just relative to peers via group-norm. Keep small so
-    # it does not dominate the useful-fact-write reward (~0.5–0.95).
-    silent_step_bonus: 0.1
+    # Per-fact reward (J_step verdict + crucial bonus from J_final):
+    #   ungrounded                          → -r_pen
+    #   grounded ∧ ¬meaningful              →  0
+    #   grounded ∧ meaningful               → +r_step
+    #   crucial_fact_indices contains it    → +r_bonus (additive, not gated)
+    # Silent step (no facts written) → 0. Per-step r_fact[t] is the sum over
+    # facts written at step t. Crucial-heavier defaults push toward
+    # fewer-but-load-bearing annotations.
+    r_step: 0.3
+    r_pen: 0.5
+    r_bonus: 0.7
     # Linear length penalty subtracted from r_reason (regardless of rank):
     #   r_reason = rank_reward − reason_length_penalty · reason_tokens / response_length
     # Caps unbounded reasoning growth that the rank judge alone can't suppress.
@@ -275,9 +272,10 @@ algorithm:
     w_fact: 1.0
     w_reason: 1.0
     w_final: 1.0
-    # Judge configuration (final + rank judges can share a model)
+    # Judge configuration (final/step/rank judges can share a model)
     final_judge_model: "doubao-seed-2-0-pro-260215"
     rank_judge_model: "doubao-seed-2-0-pro-260215"
+    step_judge_model: "doubao-seed-2-0-pro-260215"
     judge_base_url: null  # defaults to OPENAI_BASE_URL env var
     max_retries: 3
     max_judge_workers: 16

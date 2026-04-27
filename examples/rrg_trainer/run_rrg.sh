@@ -20,11 +20,13 @@ python3 -m verl.trainer.main_ppo \
     algorithm.rrg.w_fact=1.0 \
     algorithm.rrg.w_reason=1.0 \
     algorithm.rrg.w_final=1.0 \
-    algorithm.rrg.token_scale=16.0 \
-    algorithm.rrg.alpha_fact_penalty=0.2 \
+    algorithm.rrg.r_step=0.3 \
+    algorithm.rrg.r_pen=0.5 \
+    algorithm.rrg.r_bonus=0.7 \
     algorithm.rrg.reason_length_penalty=0.3 \
     algorithm.rrg.final_judge_model=doubao-seed-2-0-pro-260215 \
     algorithm.rrg.rank_judge_model=doubao-seed-2-0-pro-260215 \
+    algorithm.rrg.step_judge_model=doubao-seed-2-0-pro-260215 \
     algorithm.rrg.max_judge_workers=16 \
     algorithm.rrg.max_retries=3 \
     reward_model.reward_manager=rrg \

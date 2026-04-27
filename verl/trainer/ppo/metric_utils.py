@@ -25,6 +25,7 @@ import torch
 from verl import DataProto
 from verl.utils.import_utils import deprecated
 
+
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
     """
@@ -49,12 +50,12 @@ def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
 def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     """
     Computes information about prompts and responses from a batch.
-    
+
     This is an internal helper function that extracts masks and lengths for prompts and responses.
-    
+
     Args:
         batch: A DataProto object containing batch data with responses and attention masks.
-        
+
     Returns:
         A dictionary containing:
             - response_mask: Attention mask for the response tokens
@@ -118,7 +119,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
-    unique_traj_uid, unique_idx = np.unique(batch.non_tensor_batch['traj_uid'], return_index=True)
+    unique_traj_uid, unique_idx = np.unique(batch.non_tensor_batch["traj_uid"], return_index=True)
 
     if use_critic:
         values = batch.batch["values"]
@@ -166,20 +167,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
         # episode
-        "episode/reward/mean": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].mean().item(),
-        "episode/reward/max": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].max().item(),
-        "episode/reward/min": 
-            batch.non_tensor_batch["episode_rewards"][unique_idx].min().item(),
-        "episode/length/mean": 
-            batch.non_tensor_batch["episode_lengths"][unique_idx].mean().item(),
-        "episode/length/max":
-            batch.non_tensor_batch["episode_lengths"][unique_idx].max().item(),
-        "episode/length/min": 
-            batch.non_tensor_batch["episode_lengths"][unique_idx].min().item(),
-        "episode/tool_call_count/mean": 
-            batch.non_tensor_batch["tool_callings"][unique_idx].mean().item(),
+        "episode/reward/mean": batch.non_tensor_batch["episode_rewards"][unique_idx].mean().item(),
+        "episode/reward/max": batch.non_tensor_batch["episode_rewards"][unique_idx].max().item(),
+        "episode/reward/min": batch.non_tensor_batch["episode_rewards"][unique_idx].min().item(),
+        "episode/length/mean": batch.non_tensor_batch["episode_lengths"][unique_idx].mean().item(),
+        "episode/length/max": batch.non_tensor_batch["episode_lengths"][unique_idx].max().item(),
+        "episode/length/min": batch.non_tensor_batch["episode_lengths"][unique_idx].min().item(),
+        "episode/tool_call_count/mean": batch.non_tensor_batch["tool_callings"][unique_idx].mean().item(),
         # "episode/tool_call_count/max":
         #     batch.non_tensor_batch["tool_callings"][unique_idx].max().item(),
         # "episode/tool_call_count/min":
@@ -214,8 +208,9 @@ def compute_rrg_metrics(batch: DataProto) -> Dict[str, Any]:
         "rrg/reason_reward/mean": float(reason_r.mean()) if reason_r.size else 0.0,
         "rrg/reason_reward/abs_mean": float(np.abs(reason_r).mean()) if reason_r.size else 0.0,
         "rrg/final_reward/step_mean": float(final_r.mean()) if final_r.size else 0.0,
-        # Useful-fact rate: fraction of steps where the final judge attributed at least one written fact.
-        # r_fact > 0 is exactly the useful-and-written case; "write nothing" → 0; "write useless" → < 0.
+        # Useful-fact rate: fraction of steps with net-positive r_fact (any
+        # meaningful or crucial fact written, outweighing any ungrounded ones).
+        # Silent steps → 0; grounded-but-trivial-only → 0; ungrounded-dominant → < 0.
         "rrg/useful_rate_step": float((fact_r > 0).mean()) if fact_r.size else 0.0,
         # Token-pressure health
         "rrg/fact_tokens/mean": float(fact_tokens.mean()) if fact_tokens.size else 0.0,
@@ -245,9 +240,7 @@ def compute_rrg_metrics(batch: DataProto) -> Dict[str, Any]:
         metrics["rrg/response_length/fact_mean"] = float(fm.sum(-1).mean().item())
         metrics["rrg/response_length/reason_mean"] = float(rm.sum(-1).mean().item())
         if metrics["rrg/adv/reason_abs_mean"] > 0:
-            metrics["rrg/adv/ratio_fact_over_reason"] = (
-                metrics["rrg/adv/fact_abs_mean"] / metrics["rrg/adv/reason_abs_mean"]
-            )
+            metrics["rrg/adv/ratio_fact_over_reason"] = metrics["rrg/adv/fact_abs_mean"] / metrics["rrg/adv/reason_abs_mean"]
 
     # Parse stats stashed by the mask-building site (ray_trainer.py).
     parse_stats = batch.meta_info.get("rrg_parse_stats") if hasattr(batch, "meta_info") else None
@@ -264,10 +257,19 @@ def compute_rrg_metrics(batch: DataProto) -> Dict[str, Any]:
         metrics["rrg/judge/final_failures"] = int(judge_stats.get("final_failures", 0))
         metrics["rrg/judge/rank_calls"] = int(judge_stats.get("rank_calls", 0))
         metrics["rrg/judge/rank_failures"] = int(judge_stats.get("rank_failures", 0))
-        total_calls = metrics["rrg/judge/final_calls"] + metrics["rrg/judge/rank_calls"]
-        total_fails = metrics["rrg/judge/final_failures"] + metrics["rrg/judge/rank_failures"]
+        metrics["rrg/judge/step_calls"] = int(judge_stats.get("step_calls", 0))
+        metrics["rrg/judge/step_failures"] = int(judge_stats.get("step_failures", 0))
+        total_calls = metrics["rrg/judge/final_calls"] + metrics["rrg/judge/rank_calls"] + metrics["rrg/judge/step_calls"]
+        total_fails = metrics["rrg/judge/final_failures"] + metrics["rrg/judge/rank_failures"] + metrics["rrg/judge/step_failures"]
         if total_calls > 0:
             metrics["rrg/judge/failure_rate"] = total_fails / total_calls
+
+        fact_total = int(judge_stats.get("fact_total", 0))
+        if fact_total > 0:
+            metrics["rrg/fact_quality/grounded_rate"] = int(judge_stats.get("fact_grounded", 0)) / fact_total
+            metrics["rrg/fact_quality/meaningful_rate"] = int(judge_stats.get("fact_meaningful", 0)) / fact_total
+            metrics["rrg/fact_quality/crucial_rate"] = int(judge_stats.get("fact_crucial", 0)) / fact_total
+            metrics["rrg/fact_quality/total"] = fact_total
 
     return metrics
 
@@ -275,9 +277,9 @@ def compute_rrg_metrics(batch: DataProto) -> Dict[str, Any]:
 def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.
-    
-    This function calculates both raw timing metrics (in seconds) and per-token timing metrics 
-    (in milliseconds) for various processing stages like generation, reference computation, 
+
+    This function calculates both raw timing metrics (in seconds) and per-token timing metrics
+    (in milliseconds) for various processing stages like generation, reference computation,
     value computation, advantage computation, and model updates.
 
     Args:
@@ -314,23 +316,23 @@ def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Di
 def compute_throughout_metrics(batch: DataProto, timing_raw: Dict[str, float], n_gpus: int) -> Dict[str, Any]:
     """
     Computes throughput metrics for PPO training.
-    
+
     This function calculates performance metrics related to token processing speed,
     including the total number of tokens processed, time per step, and throughput
     (tokens per second per GPU).
-    
+
     Args:
         batch: A DataProto object containing batch data with meta information about token counts.
         timing_raw: A dictionary mapping stage names to their execution times in seconds.
                    Must contain a "step" key with the total step time.
         n_gpus: Number of GPUs used for training.
-        
+
     Returns:
         A dictionary containing:
             - perf/total_num_tokens: Total number of tokens processed in the batch
             - perf/time_per_step: Time taken for the step in seconds
             - perf/throughput: Tokens processed per second per GPU
-            
+
     Note:
         The throughput is calculated as total_tokens / (time * n_gpus) to normalize
         across different GPU counts.
@@ -427,12 +429,12 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
 def process_validation_metrics(data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42) -> dict[str, dict[str, dict[str, float]]]:
     """
     Process validation metrics into a structured format with statistical analysis.
-    
+
     This function organizes validation metrics by data source and prompt, then computes
     various statistical measures including means, standard deviations, best/worst values,
     and majority voting results. It also performs bootstrap sampling to estimate statistics
     for different sample sizes.
-    
+
     Args:
         data_sources: List of data source identifiers for each sample.
         sample_inputs: List of input prompts corresponding to each sample.
@@ -448,7 +450,7 @@ def process_validation_metrics(data_sources: list[str], sample_inputs: list[str]
                 }
             }
         }
-        
+
         Where metric_name includes:
         - "mean@N": Mean value across N samples
         - "std@N": Standard deviation across N samples
@@ -458,7 +460,7 @@ def process_validation_metrics(data_sources: list[str], sample_inputs: list[str]
         - "worst@N/std": Standard deviation of the worst values in bootstrap samples
         - "maj@N/mean": Mean of majority voting results in bootstrap samples (if "pred" exists)
         - "maj@N/std": Standard deviation of majority voting results (if "pred" exists)
-        
+
     Example:
         >>> data_sources = ["source1", "source1", "source2"]
         >>> sample_inputs = ["prompt1", "prompt1", "prompt2"]

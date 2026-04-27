@@ -1,20 +1,22 @@
-RUN_NAME=rrg_v2_boot_0425_fix
+RUN_NAME=rrg_v3_boot_0426
 JUDGE_MODEL=doubao-seed-2-0-lite-260215
 TRAIN_FILES=data/rl/train.parquet
 TEST_FILES=data/rl/test.parquet
 TARJ_DATA_PATH=data/rl/traces_clean.json
-BASE_MODEL=/home/liuguohong/.cache/modelscope/hub/models/Qwen/Qwen3-VL-8B-Instruct
+BASE_MODEL=/home/liuguohong/.cache/modelscope/hub/models/Qwen/Qwen3-VL-4B-Instruct
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=rrg \
     algorithm.rrg.w_fact=1.0 \
     algorithm.rrg.w_reason=1.0 \
     algorithm.rrg.w_final=1.0 \
-    algorithm.rrg.token_scale=24.0 \
-    algorithm.rrg.alpha_fact_penalty=0.2 \
+    algorithm.rrg.r_step=0.3 \
+    algorithm.rrg.r_pen=0.1 \
+    algorithm.rrg.r_bonus=0.7 \
     algorithm.rrg.reason_length_penalty=0.3 \
     algorithm.rrg.final_judge_model=$JUDGE_MODEL \
     algorithm.rrg.rank_judge_model=$JUDGE_MODEL \
+    algorithm.rrg.step_judge_model=$JUDGE_MODEL \
     algorithm.rrg.max_judge_workers=128 \
     algorithm.rrg.max_retries=5 \
     algorithm.rrg.debug_log=True \
@@ -35,7 +37,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.ref.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
@@ -50,7 +52,7 @@ python3 -m verl.trainer.main_ppo \
     env.env_name=rrg \
     env.seed=42 \
     env.max_steps=0 \
-    env.rollout.n=2 \
+    env.rollout.n=4 \
     env.rrg.trajectory_data_path=$TARJ_DATA_PATH \
     env.rrg.reasoning_history_length=5 \
     trainer.total_epochs=2 \

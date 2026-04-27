@@ -1,14 +1,16 @@
 """RRG advantage estimator with span-masked, group-normalized advantages.
 
 RRG v2: two span types (reasoning, fact). Three reward signals:
-    - fact_rewards:  per-step scalar, already token-discounted.
+    - fact_rewards:   per-step scalar = sum of per-fact rewards from J_step
+      (grounded/meaningful) plus crucial bonus from J_final. Silent step → 0.
     - reason_rewards: per-step scalar from rank judge, in [-1, 1].
-    - final_rewards: per-trajectory (can_conclude binary) broadcast to all
+    - final_rewards:  per-trajectory (can_conclude binary) broadcast to all
       siblings of the trajectory before group normalization.
 
 Tokens in the fact span receive w_fact * A_fact + w_final * A_final.
 Tokens in the reasoning span receive w_reason * A_reason (no A_final).
 """
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -58,15 +60,15 @@ def _group_normalize(
 
 
 def compute_rrg_advantage(
-    token_level_rewards: torch.Tensor,   # (bs, response_length) — combined scalar, unused but kept for API parity
-    response_mask: torch.Tensor,         # (bs, response_length)
-    index: np.ndarray,                   # (bs,) — step-group uid (e.g. f"{uid}_{step_t}")
-    traj_index: np.ndarray,              # (bs,) — sibling-rollout group uid for final reward normalization
-    fact_rewards: np.ndarray,            # (bs,) — r_fact per step (already token-discounted)
-    reason_rewards: np.ndarray,          # (bs,) — r_reason per step in [-1, 1]
-    final_rewards: np.ndarray,           # (bs,) — r_final per trajectory (broadcast across all steps of that trajectory)
-    fact_masks: torch.Tensor,            # (bs, response_length) — bool
-    reason_masks: torch.Tensor,          # (bs, response_length) — bool
+    token_level_rewards: torch.Tensor,  # (bs, response_length) — combined scalar, unused but kept for API parity
+    response_mask: torch.Tensor,  # (bs, response_length)
+    index: np.ndarray,  # (bs,) — step-group uid (e.g. f"{uid}_{step_t}")
+    traj_index: np.ndarray,  # (bs,) — sibling-rollout group uid for final reward normalization
+    fact_rewards: np.ndarray,  # (bs,) — r_fact per step (sum of per-fact J_step + crucial bonus)
+    reason_rewards: np.ndarray,  # (bs,) — r_reason per step in [-1, 1]
+    final_rewards: np.ndarray,  # (bs,) — r_final per trajectory (broadcast across all steps of that trajectory)
+    fact_masks: torch.Tensor,  # (bs, response_length) — bool
+    reason_masks: torch.Tensor,  # (bs, response_length) — bool
     w_fact: float = 1.0,
     w_reason: float = 1.0,
     w_final: float = 1.0,
@@ -89,11 +91,7 @@ def compute_rrg_advantage(
     fact_mask_f = fact_masks.float().to(device)
     reason_mask_f = reason_masks.float().to(device)
 
-    advantages = (
-        w_fact * a_fact.unsqueeze(-1) * fact_mask_f
-        + w_reason * a_reason.unsqueeze(-1) * reason_mask_f
-        + w_final * a_final.unsqueeze(-1) * fact_mask_f
-    )
+    advantages = w_fact * a_fact.unsqueeze(-1) * fact_mask_f + w_reason * a_reason.unsqueeze(-1) * reason_mask_f + w_final * a_final.unsqueeze(-1) * fact_mask_f
     advantages = advantages * response_mask
 
     return advantages, advantages

@@ -1,8 +1,11 @@
-"""RRG Reward Manager — two-judge flow over trajectories and step groups.
+"""RRG Reward Manager — three-judge flow over trajectories and step groups.
 
 After rollout, this manager computes three per-item reward signals:
-    * rrg_fact_rewards:   per-step ``useful_binary / (1 + fact_tokens/token_scale)``,
-                          where useful is attributed by the trajectory-end judge.
+    * rrg_fact_rewards:   per-step sum of per-fact rewards from a step-level
+                          grounding judge (J_step) plus an additive crucial
+                          bonus from the trajectory-end judge (J_final).
+                          Per-fact: ungrounded → -r_pen, grounded ∧ trivial → 0,
+                          grounded ∧ meaningful → +r_step. Crucial → +r_bonus.
     * rrg_reason_rewards: per-step rank reward in [-1, 1] from a sibling-rank
                           judge over the n rollouts at each source step.
     * rrg_final_rewards:  per-trajectory binary can-conclude signal.
@@ -10,6 +13,7 @@ After rollout, this manager computes three per-item reward signals:
 The advantage estimator reads these via ``reward_extra_info`` and composes
 token-level advantages using ``rrg_fact_mask`` and ``rrg_reason_mask``.
 """
+
 from __future__ import annotations
 
 import base64
@@ -42,15 +46,26 @@ except ImportError:
 # Judge output schemas
 # ---------------------------------------------------------------------------
 
+
 class FinalJudgment(BaseModel):  # type: ignore[misc]
     reasoning: str
     can_conclude: bool
-    useful_fact_indices: list[int]
+    crucial_fact_indices: list[int]
 
 
 class RankJudgment(BaseModel):  # type: ignore[misc]
     reasoning: str
     order: list[int]
+
+
+class FactQuality(BaseModel):  # type: ignore[misc]
+    grounded: bool
+    meaningful: bool
+
+
+class StepJudgment(BaseModel):  # type: ignore[misc]
+    reasoning: str
+    fact_quality: list[FactQuality]
 
 
 # ---------------------------------------------------------------------------
@@ -70,13 +85,50 @@ Your job has two parts, both based ONLY on the screenshot + the observation bank
 1. can_conclude: can you conclude that the given finish action is the correct
    next step for this task? Respond true if the evidence (screenshot + bank)
    supports the finish action, false otherwise.
-2. useful_fact_indices: list the observation-bank indices that were GENUINELY
-   NECESSARY to reach this conclusion. Be parsimonious — exclude indices that
-   are redundant with the screenshot or with each other. If no observation
-   was necessary, return an empty list.
+2. crucial_fact_indices: list the observation-bank indices whose information
+   was GENUINELY LOAD-BEARING for reaching can_conclude — facts that, if
+   removed, would make the finish action unsupportable from the final
+   screenshot alone. Be strict and parsimonious: if a fact is interesting but
+   not load-bearing for the conclusion, exclude it. If the final screenshot
+   alone supports the conclusion, return an empty list. This is a sparse
+   bonus signal, not a quality rating — quality is judged elsewhere.
 
-Respond with JSON: {"reasoning": "...", "can_conclude": <true|false>, "useful_fact_indices": [<int>, ...]}.
+Respond with JSON: {"reasoning": "...", "can_conclude": <true|false>, "crucial_fact_indices": [<int>, ...]}.
 Only include indices that exist in the observation bank.\
+"""
+
+STEP_JUDGE_PROMPT = """\
+You are a per-step fact validator for a GUI agent annotation system.
+
+You are given:
+- A task goal.
+- The BEFORE screenshot at this step (the GUI state the agent observed when
+  writing these facts).
+- The existing observation bank (numbered facts already recorded in earlier
+  steps), shown for redundancy detection only.
+- A list of NEW facts the agent wrote at this step. You must rate each new
+  fact independently.
+
+For each NEW fact, decide two booleans:
+1. grounded: is the fact accurately supported by the BEFORE screenshot? A
+   fact is grounded if a careful reader looking only at the screenshot would
+   agree it is true. Speculation, hallucination, or claims about UI elements
+   not visible in the screenshot are NOT grounded.
+2. meaningful: is the fact a non-trivial, non-redundant observation that
+   would help a downstream reader understand the GUI state? Mark FALSE if:
+     - the fact is implied by, or duplicates, any item already in the
+       existing observation bank;
+     - the fact is one of several near-duplicate slices of the same
+       observation (atomic-but-redundant splitting — keep at most one per
+       distinct observation, mark the rest not meaningful);
+     - the fact is overly generic ("there is a button on the screen", "the
+       screen has UI elements"), tautological, or restates the task goal
+       without adding new information.
+
+Order MUST match the order of NEW facts as given (0, 1, 2, ...). Output
+exactly one entry per new fact.
+
+Respond with JSON: {"reasoning": "...", "fact_quality": [{"grounded": <bool>, "meaningful": <bool>}, ...]}.\
 """
 
 RANK_JUDGE_PROMPT = """\
@@ -185,16 +237,8 @@ def call_final_judge(
     base_url: str | None,
     max_retries: int,
 ) -> FinalJudgment:
-    bank_text = (
-        "empty"
-        if not fact_bank
-        else "\n".join(f"{i}: {obs}" for i, obs in enumerate(fact_bank))
-    )
-    user_text = (
-        f"Task Goal: {task}\n"
-        f"Finish Action: {finish_action}\n"
-        f"Observation Bank:\n{bank_text}"
-    )
+    bank_text = "empty" if not fact_bank else "\n".join(f"{i}: {obs}" for i, obs in enumerate(fact_bank))
+    user_text = f"Task Goal: {task}\nFinish Action: {finish_action}\nObservation Bank:\n{bank_text}"
 
     def _call():
         client = _get_client(base_url)
@@ -202,10 +246,13 @@ def call_final_judge(
             model=model,
             messages=[
                 {"role": "system", "content": FINAL_JUDGE_PROMPT},
-                {"role": "user", "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": _encode_image(image_path)}},
-                ]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": _encode_image(image_path)}},
+                    ],
+                },
             ],
             response_format={"type": "json_object"},
         )
@@ -213,6 +260,44 @@ def call_final_judge(
         if not content:
             raise ValueError("FinalJudgment completion output is empty")
         return _parse_json_response(content, FinalJudgment)
+
+    return _llm_call_with_retry(_call, max_retries)
+
+
+def call_step_judge(
+    task: str,
+    image_path: str,
+    existing_bank: list[str],
+    new_facts: list[str],
+    model: str,
+    base_url: str | None,
+    max_retries: int,
+) -> StepJudgment:
+    bank_text = "empty" if not existing_bank else "\n".join(f"{i}: {obs}" for i, obs in enumerate(existing_bank))
+    new_text = "\n".join(f"[{i}] {fact}" for i, fact in enumerate(new_facts))
+    user_text = f"Task Goal: {task}\nExisting Observation Bank (for redundancy check only):\n{bank_text}\n\nNEW facts written at this step (N={len(new_facts)}):\n{new_text}"
+
+    def _call():
+        client = _get_client(base_url)
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": STEP_JUDGE_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": _encode_image(image_path)}},
+                    ],
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("StepJudgment completion output is empty")
+        return _parse_json_response(content, StepJudgment)
 
     return _llm_call_with_retry(_call, max_retries)
 
@@ -229,18 +314,8 @@ def call_rank_judge(
 ) -> RankJudgment:
     labeled = "\n\n".join(f"[{i}]\n{text}" for i, text in enumerate(reasonings))
     has_after = bool(next_image_path) and os.path.isfile(next_image_path)
-    image_note = (
-        "Image 1 = BEFORE (the only correctness source). Image 2 = AFTER "
-        "(action-effect fact-check only; never a justification source)."
-        if has_after
-        else "Image 1 = BEFORE. No AFTER screenshot is available for this step."
-    )
-    user_text = (
-        f"Task Goal: {task}\n"
-        f"Ground Truth Next Action: {ground_truth_action}\n"
-        f"{image_note}\n"
-        f"Candidate reasonings (N={len(reasonings)}):\n\n{labeled}"
-    )
+    image_note = "Image 1 = BEFORE (the only correctness source). Image 2 = AFTER (action-effect fact-check only; never a justification source)." if has_after else "Image 1 = BEFORE. No AFTER screenshot is available for this step."
+    user_text = f"Task Goal: {task}\nGround Truth Next Action: {ground_truth_action}\n{image_note}\nCandidate reasonings (N={len(reasonings)}):\n\n{labeled}"
 
     user_content: list[dict[str, Any]] = [
         {"type": "text", "text": user_text},
@@ -274,6 +349,7 @@ def call_rank_judge(
 # Main Reward Manager
 # ---------------------------------------------------------------------------
 
+
 class RRGRewardManager:
     """Two-judge reward manager for RRG v2."""
 
@@ -290,24 +366,19 @@ class RRGRewardManager:
         self.envs = envs
         cfg = config or {}
 
-        self.token_scale = float(cfg.get("token_scale", 32.0))
-        # Penalty applied to written-but-not-useful fact tokens. Breaks the
-        # zero-for-zero degeneracy where "write nothing" and "write useless
-        # facts" both yield r_fact = 0; with this knob, useless writes are
-        # strictly worse than empty writes.
-        self.alpha_fact_penalty = float(cfg.get("alpha_fact_penalty", 0.2))
-        # Absolute reward for silent steps (no facts written) inside
-        # trajectories where J_final returns can_conclude=True. Without this,
-        # correct restraint only shows up relative to noisier peers; with it,
-        # the silent policy gets a small positive signal so r_final still has
-        # somewhere to land via Ã_fact group-norm even when fact_mask is empty.
-        self.silent_step_bonus = float(cfg.get("silent_step_bonus", 0.1))
+        # Per-fact reward magnitudes (J_step verdict + crucial bonus from J_final).
+        # ungrounded → -r_pen; grounded ∧ meaningful → +r_step;
+        # crucial_fact_indices contribution is +r_bonus (additive, not gated).
+        self.r_step = float(cfg.get("r_step", 0.3))
+        self.r_pen = float(cfg.get("r_pen", 0.5))
+        self.r_bonus = float(cfg.get("r_bonus", 0.7))
         # Linear length penalty subtracted from r_reason: penalty grows with
         # reason_tokens / response_length, regardless of rank. Caps unbounded
         # reasoning growth that the rank judge alone can't suppress.
         self.reason_length_penalty = float(cfg.get("reason_length_penalty", 0.3))
         self.final_judge_model = cfg.get("final_judge_model", "doubao-seed-2-0-pro-260215")
         self.rank_judge_model = cfg.get("rank_judge_model", self.final_judge_model)
+        self.step_judge_model = cfg.get("step_judge_model", self.final_judge_model)
         self.judge_base_url = cfg.get("judge_base_url", None)
         self.max_retries = int(cfg.get("max_retries", 3))
         self.max_judge_workers = int(cfg.get("max_judge_workers", 16))
@@ -362,6 +433,13 @@ class RRGRewardManager:
             "final_failures": 0,
             "rank_calls": 0,
             "rank_failures": 0,
+            "step_calls": 0,
+            "step_failures": 0,
+            # Fact-quality aggregates over all per-fact judgements in this batch.
+            "fact_total": 0,
+            "fact_grounded": 0,
+            "fact_meaningful": 0,
+            "fact_crucial": 0,
         }
 
         fact_rewards = np.zeros(batch_size, dtype=np.float32)
@@ -443,10 +521,7 @@ class RRGRewardManager:
             image_path = last_meta.get("screenshot_path", "")
             raw_action = last_meta.get("ground_truth_action", "")
             finish_action_str = raw_action if isinstance(raw_action, str) else json.dumps(raw_action)
-            fact_bank = (
-                last_meta.get("final_fact_bank")
-                or traj_fact_content.get(env_slot, [])
-            )
+            fact_bank = last_meta.get("final_fact_bank") or traj_fact_content.get(env_slot, [])
 
             if not image_path or not os.path.isfile(image_path):
                 continue  # default: can_conclude=True, useful=all (handled below)
@@ -469,23 +544,101 @@ class RRGRewardManager:
             env_slot = all_final_futures[fut]
             try:
                 judgment = fut.result()
-                useful_set = {int(i) for i in judgment.useful_fact_indices}
-                final_results[env_slot] = (bool(judgment.can_conclude), useful_set)
+                crucial_set = {int(i) for i in judgment.crucial_fact_indices}
+                final_results[env_slot] = (bool(judgment.can_conclude), crucial_set)
                 if self.debug_log:
-                    self._log_debug("final_judge", {
-                        "env_slot": env_slot,
-                        "can_conclude": judgment.can_conclude,
-                        "useful": sorted(useful_set),
-                        "reasoning": judgment.reasoning[:300],
-                    }, file_overrides={"reasoning": judgment.reasoning})
+                    self._log_debug(
+                        "final_judge",
+                        {
+                            "env_slot": env_slot,
+                            "can_conclude": judgment.can_conclude,
+                            "crucial": sorted(crucial_set),
+                            "reasoning": judgment.reasoning[:300],
+                        },
+                        file_overrides={"reasoning": judgment.reasoning},
+                    )
             except Exception as exc:
-                # Conservative default: can_conclude=True, no useful facts (avoids false positives)
+                # Conservative default: can_conclude=True, no crucial facts (avoids false positives)
                 final_results[env_slot] = (True, set())
                 judge_stats["final_failures"] += 1
-                self._log_error("final_judge_failed", {
-                    "env_slot": env_slot,
-                    "error": repr(exc),
-                })
+                self._log_error(
+                    "final_judge_failed",
+                    {
+                        "env_slot": env_slot,
+                        "error": repr(exc),
+                    },
+                )
+
+        # ------------------------------------------------------------------ #
+        # Phase S — Step judge per (env_slot, step_t) where facts were written #
+        # ------------------------------------------------------------------ #
+        # One call per step that wrote at least one new fact. Returns a list of
+        # FactQuality aligned positionally with the new facts at that step.
+        all_step_futures: dict[Future, tuple[int, int, int]] = {}
+        for env_slot, _ in enumerate(unique_trajs_ordered):
+            traj_meta = step_metadata.get(str(env_slot), [])
+            step_map = step_fact_idxs.get(env_slot, {})
+            for t, meta in enumerate(traj_meta):
+                if not step_map.get(t):
+                    continue
+                image_path = meta.get("screenshot_path", "")
+                if not image_path or not os.path.isfile(image_path):
+                    continue
+                new_facts = [upd.get("observation", "") for upd in meta.get("writing_updates", []) if upd.get("action") == "add" and upd.get("observation", "")]
+                if not new_facts:
+                    continue
+                existing_bank = list(meta.get("observations_before", []) or [])
+                fut = pool.submit(
+                    call_step_judge,
+                    meta.get("task", ""),
+                    image_path,
+                    existing_bank,
+                    new_facts,
+                    self.step_judge_model,
+                    self.judge_base_url,
+                    self.max_retries,
+                )
+                all_step_futures[fut] = (env_slot, t, len(new_facts))
+                judge_stats["step_calls"] += 1
+
+        # step_results[(env_slot, step_t)] = list[FactQuality]; positional with
+        # new_facts at that step. Failure default: all neutral (grounded=True,
+        # meaningful=False) → r_per_fact = 0, no punishment on judge failure.
+        step_results: dict[tuple[int, int], list[FactQuality]] = {}
+        for fut in as_completed(all_step_futures):
+            env_slot, t, n_facts = all_step_futures[fut]
+            try:
+                judgment = fut.result()
+                qualities = list(judgment.fact_quality)
+                # Pad/truncate to n_facts to keep positional alignment robust.
+                if len(qualities) < n_facts:
+                    qualities.extend(FactQuality(grounded=True, meaningful=False) for _ in range(n_facts - len(qualities)))
+                elif len(qualities) > n_facts:
+                    qualities = qualities[:n_facts]
+                step_results[(env_slot, t)] = qualities
+                if self.debug_log:
+                    self._log_debug(
+                        "step_judge",
+                        {
+                            "env_slot": env_slot,
+                            "step": t,
+                            "n_facts": n_facts,
+                            "fact_quality": [{"grounded": q.grounded, "meaningful": q.meaningful} for q in qualities],
+                            "reasoning": judgment.reasoning[:200],
+                        },
+                        file_overrides={"reasoning": judgment.reasoning},
+                    )
+            except Exception as exc:
+                step_results[(env_slot, t)] = [FactQuality(grounded=True, meaningful=False) for _ in range(n_facts)]
+                judge_stats["step_failures"] += 1
+                self._log_error(
+                    "step_judge_failed",
+                    {
+                        "env_slot": env_slot,
+                        "step": t,
+                        "error": repr(exc),
+                    },
+                )
 
         # ------------------------------------------------------------------ #
         # Phase R — Rank judge per (uid, step_t)                              #
@@ -505,9 +658,7 @@ class RRGRewardManager:
         for uid_str, sibling_slots in uid_to_slots.items():
             if len(sibling_slots) < 2:
                 continue
-            max_t = max(
-                len(step_metadata.get(str(s), [])) for s in sibling_slots
-            )
+            max_t = max(len(step_metadata.get(str(s), [])) for s in sibling_slots)
             for t in range(max_t):
                 reasonings: list[str] = []
                 valid_slots: list[int] = []
@@ -564,22 +715,29 @@ class RRGRewardManager:
                 for local_idx in range(n):
                     rank_by_local.setdefault(local_idx, middle)
                 if self.debug_log:
-                    self._log_debug("rank_judge", {
-                        "uid": uid_str,
-                        "step": t,
-                        "n": n,
-                        "order": judgment.order,
-                        "reasoning": judgment.reasoning[:200],
-                    }, file_overrides={"reasoning": judgment.reasoning})
+                    self._log_debug(
+                        "rank_judge",
+                        {
+                            "uid": uid_str,
+                            "step": t,
+                            "n": n,
+                            "order": judgment.order,
+                            "reasoning": judgment.reasoning[:200],
+                        },
+                        file_overrides={"reasoning": judgment.reasoning},
+                    )
             except Exception as exc:
                 for local_idx in range(n):
                     rank_by_local[local_idx] = middle
                 judge_stats["rank_failures"] += 1
-                self._log_error("rank_judge_failed", {
-                    "uid": uid_str,
-                    "step": t,
-                    "error": repr(exc),
-                })
+                self._log_error(
+                    "rank_judge_failed",
+                    {
+                        "uid": uid_str,
+                        "step": t,
+                        "error": repr(exc),
+                    },
+                )
             for local_idx, env_slot in enumerate(valid_slots):
                 rank_by_slot_step[(env_slot, t)] = rank_by_local[local_idx]
 
@@ -604,11 +762,9 @@ class RRGRewardManager:
 
             # Final reward for this trajectory.
             if env_slot in final_results:
-                can_conclude, useful_indices = final_results[env_slot]
-                final_called = True
+                can_conclude, crucial_indices = final_results[env_slot]
             else:
-                can_conclude, useful_indices = True, set()
-                final_called = False
+                can_conclude, crucial_indices = True, set()
             r_final = 1.0 if can_conclude else 0.0
 
             step_fact_idx_map = step_fact_idxs.get(env_slot, {})
@@ -618,15 +774,6 @@ class RRGRewardManager:
                     break
 
                 global_idxs_at_t = step_fact_idx_map.get(local_t, [])
-                if global_idxs_at_t:
-                    if final_called:
-                        useful_at_t = any(g in useful_indices for g in global_idxs_at_t)
-                    else:
-                        # Judge didn't run — give the benefit of the doubt.
-                        useful_at_t = True
-                    useful_binary = 1.0 if useful_at_t else 0.0
-                else:
-                    useful_binary = 0.0
 
                 if fact_mask_batch is not None:
                     fact_tokens = int(fact_mask_batch[batch_idx].sum().item())
@@ -637,19 +784,41 @@ class RRGRewardManager:
                 else:
                     reason_tokens = 0
 
-                # r_fact branches:
-                #   silent + can_conclude → +silent_step_bonus (correct restraint)
-                #   silent + not concluded → 0
-                #   useful write → +1 / (1 + fact_tokens / token_scale)
-                #   useless write → −alpha_fact_penalty · (fact_tokens / token_scale)
-                num_facts_at_t = len(global_idxs_at_t)
-                scale_ratio = fact_tokens / max(1e-6, self.token_scale)
-                if num_facts_at_t == 0:
-                    r_fact = self.silent_step_bonus if can_conclude else 0.0
-                elif useful_binary > 0:
-                    r_fact = 1.0 / (1.0 + scale_ratio)
-                else:
-                    r_fact = -self.alpha_fact_penalty * scale_ratio
+                # Per-fact reward aggregation (silent step → 0):
+                #   ungrounded                             → -r_pen
+                #   grounded ∧ ¬meaningful                 →  0
+                #   grounded ∧ meaningful                  → +r_step
+                #   + crucial_fact_indices contains it     → +r_bonus (additive)
+                # r_fact[t] = Σ over facts written at step t.
+                qualities = step_results.get((env_slot, local_t), [])
+                per_fact_rewards: list[float] = []
+                for fact_pos, global_idx in enumerate(global_idxs_at_t):
+                    if fact_pos < len(qualities):
+                        q = qualities[fact_pos]
+                        grounded = bool(q.grounded)
+                        meaningful = bool(q.meaningful)
+                    else:
+                        # Step judge didn't run / fewer entries than facts:
+                        # neutral default — no reward, no penalty.
+                        grounded, meaningful = True, False
+                    is_crucial = int(global_idx) in crucial_indices
+                    if not grounded:
+                        per_fact = -self.r_pen
+                    elif meaningful:
+                        per_fact = self.r_step
+                    else:
+                        per_fact = 0.0
+                    if is_crucial:
+                        per_fact += self.r_bonus
+                    per_fact_rewards.append(per_fact)
+                    judge_stats["fact_total"] += 1
+                    if grounded:
+                        judge_stats["fact_grounded"] += 1
+                    if grounded and meaningful:
+                        judge_stats["fact_meaningful"] += 1
+                    if is_crucial:
+                        judge_stats["fact_crucial"] += 1
+                r_fact = float(sum(per_fact_rewards))
 
                 # r_reason: rank-based reward minus a flat length penalty so
                 # long reasoning is bounded for ALL ranks (not just the best).
@@ -685,39 +854,58 @@ class RRGRewardManager:
                 debug_steps = []
                 for local_t in range(min(len(traj_meta), self.debug_log_samples)):
                     batch_idx = int(traj_indices[local_t]) if local_t < len(traj_indices) else -1
-                    debug_steps.append({
-                        "step": local_t,
-                        "num_facts": len(step_fact_idx_map.get(local_t, [])),
-                        "fact_tokens": int(fact_tokens_arr[batch_idx]) if batch_idx >= 0 else 0,
-                        "fact_reward": float(fact_rewards[batch_idx]) if batch_idx >= 0 else 0.0,
-                        "reason_reward": float(reason_rewards[batch_idx]) if batch_idx >= 0 else 0.0,
-                    })
-                debug_examples.append({
-                    "env_slot": env_slot,
-                    "n_siblings": n_siblings,
-                    "can_conclude": can_conclude,
-                    "useful_count": len(useful_indices),
-                    "total_facts": len(traj_fact_content.get(env_slot, [])),
-                    "r_final": r_final,
-                    "steps": debug_steps,
-                })
+                    qualities = step_results.get((env_slot, local_t), [])
+                    step_globals = step_fact_idx_map.get(local_t, [])
+                    fact_breakdown = [
+                        {
+                            "global_idx": int(g),
+                            "grounded": bool(qualities[i].grounded) if i < len(qualities) else None,
+                            "meaningful": bool(qualities[i].meaningful) if i < len(qualities) else None,
+                            "crucial": bool(int(g) in crucial_indices),
+                        }
+                        for i, g in enumerate(step_globals)
+                    ]
+                    debug_steps.append(
+                        {
+                            "step": local_t,
+                            "num_facts": len(step_globals),
+                            "fact_tokens": int(fact_tokens_arr[batch_idx]) if batch_idx >= 0 else 0,
+                            "fact_reward": float(fact_rewards[batch_idx]) if batch_idx >= 0 else 0.0,
+                            "reason_reward": float(reason_rewards[batch_idx]) if batch_idx >= 0 else 0.0,
+                            "facts": fact_breakdown,
+                        }
+                    )
+                debug_examples.append(
+                    {
+                        "env_slot": env_slot,
+                        "n_siblings": n_siblings,
+                        "can_conclude": can_conclude,
+                        "crucial_count": len(crucial_indices),
+                        "total_facts": len(traj_fact_content.get(env_slot, [])),
+                        "r_final": r_final,
+                        "steps": debug_steps,
+                    }
+                )
 
         # Publish judge operational counters for compute_rrg_metrics.
         if hasattr(data, "meta_info") and isinstance(data.meta_info, dict):
             data.meta_info["rrg_judge_stats"] = dict(judge_stats)
 
-        self._log_debug("batch_reward_summary", {
-            "batch_size": batch_size,
-            "num_trajectories": len(unique_trajs_ordered),
-            "fact_mean": float(fact_rewards.mean()) if batch_size else 0.0,
-            "fact_nonzero": int(np.count_nonzero(fact_rewards)),
-            "reason_mean": float(reason_rewards.mean()) if batch_size else 0.0,
-            "reason_abs_mean": float(np.abs(reason_rewards).mean()) if batch_size else 0.0,
-            "final_mean": float(final_rewards.mean()) if batch_size else 0.0,
-            "fact_tokens_mean": float(fact_tokens_arr.mean()) if batch_size else 0.0,
-            "judge_stats": dict(judge_stats),
-            "examples": debug_examples,
-        })
+        self._log_debug(
+            "batch_reward_summary",
+            {
+                "batch_size": batch_size,
+                "num_trajectories": len(unique_trajs_ordered),
+                "fact_mean": float(fact_rewards.mean()) if batch_size else 0.0,
+                "fact_nonzero": int(np.count_nonzero(fact_rewards)),
+                "reason_mean": float(reason_rewards.mean()) if batch_size else 0.0,
+                "reason_abs_mean": float(np.abs(reason_rewards).mean()) if batch_size else 0.0,
+                "final_mean": float(final_rewards.mean()) if batch_size else 0.0,
+                "fact_tokens_mean": float(fact_tokens_arr.mean()) if batch_size else 0.0,
+                "judge_stats": dict(judge_stats),
+                "examples": debug_examples,
+            },
+        )
 
         if return_dict:
             return {
