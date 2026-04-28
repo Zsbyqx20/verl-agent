@@ -325,24 +325,24 @@ def call_stage1_final_judge(
 
     def _call():
         client = _get_client(base_url)
-        response = client.chat.completions.create(
+        response = client.responses.parse(
             model=model,
-            messages=[
+            input=[
                 {"role": "system", "content": STAGE1_FINAL_JUDGE_PROMPT},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": _encode_image(image_path)}},
+                        {"type": "input_text", "text": user_text},
+                        {"type": "input_image", "image_url": _encode_image(image_path)},
                     ],
                 },
             ],
-            response_format={"type": "json_object"},
+            text_format=Stage1FinalJudgment,
         )
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError("Stage1FinalJudgment completion output is empty")
-        return _parse_json_response(content, Stage1FinalJudgment)
+        result = response.output_parsed
+        if result is None:
+            raise ValueError("Stage1FinalJudgment output is None")
+        return result
 
     return _llm_call_with_retry(_call, max_retries)
 
@@ -365,19 +365,19 @@ def call_compare_judge(
 
     def _call():
         client = _get_client(base_url)
-        response = client.chat.completions.create(
+        response = client.responses.parse(
             model=model,
-            messages=[
+            input=[
                 {"role": "system", "content": STAGE2_COMPARE_PROMPT},
                 {"role": "user", "content": user_text},
             ],
-            response_format={"type": "json_object"},
+            text_format=CompareJudgment,
             temperature=0,
         )
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError("CompareJudgment completion output is empty")
-        return _parse_json_response(content, CompareJudgment)
+        result = response.output_parsed
+        if result is None:
+            raise ValueError("CompareJudgment output is None")
+        return result
 
     return _llm_call_with_retry(_call, max_retries)
 
@@ -397,25 +397,25 @@ def call_step_judge(
 
     def _call():
         client = _get_client(base_url)
-        response = client.chat.completions.create(
+        response = client.responses.parse(
             model=model,
-            messages=[
+            input=[
                 {"role": "system", "content": STEP_JUDGE_PROMPT},
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": user_text},
-                        {"type": "image_url", "image_url": {"url": _encode_image(image_path)}},
+                        {"type": "input_text", "text": user_text},
+                        {"type": "input_image", "image_url": _encode_image(image_path)},
                     ],
                 },
             ],
-            response_format={"type": "json_object"},
+            text_format=StepJudgment,
             temperature=0,
         )
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError("StepJudgment completion output is empty")
-        return _parse_json_response(content, StepJudgment)
+        result = response.output_parsed
+        if result is None:
+            raise ValueError("StepJudgment output is None")
+        return result
 
     return _llm_call_with_retry(_call, max_retries)
 
@@ -446,19 +446,19 @@ def call_rank_judge(
 
     def _call():
         client = _get_client(base_url)
-        response = client.chat.completions.create(
+        response = client.responses.parse(
             model=model,
-            messages=[
+            input=[
                 {"role": "system", "content": RANK_JUDGE_PROMPT},
                 {"role": "user", "content": user_content},
             ],
-            response_format={"type": "json_object"},
+            text_format=RankJudgment,
             temperature=0,
         )
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError("RankJudgment completion output is empty")
-        return _parse_json_response(content, RankJudgment)
+        result = response.output_parsed
+        if result is None:
+            raise ValueError("RankJudgment output is None")
+        return result
 
     return _llm_call_with_retry(_call, max_retries)
 
