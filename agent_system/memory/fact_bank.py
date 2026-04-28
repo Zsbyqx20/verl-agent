@@ -134,7 +134,7 @@ class FactBankMemory(BaseMemory):
             return "empty"
         lines = []
         for i, slot in enumerate(bank):
-            lines.append(f"{i}: {slot.current}")
+            lines.append(f"[step {slot.step_written + 1}] {i}: {slot.current}")
         return "\n".join(lines)
 
     def get_reasoning_history(self, env_idx: int, max_steps: int = -1) -> str:
