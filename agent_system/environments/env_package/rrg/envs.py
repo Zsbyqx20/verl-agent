@@ -58,12 +58,14 @@ class RRGReplayEnv:
         group_n: int,
         is_train: bool = True,
         target_image_size=None,
+        use_after_image: bool = True,
     ):
         self.batch_size = env_num * group_n
         self.group_n = group_n
         self.env_num = env_num
         self.is_train = is_train
         self._target_size: tuple[int, int] | None = _parse_size(target_image_size)
+        self._use_after_image = use_after_image
         self._rng = np.random.RandomState(seed)
 
         # Load trajectory data
@@ -117,7 +119,7 @@ class RRGReplayEnv:
                 before_image = self._load_image(step_data["image"])
                 action_str = json.dumps(step_data["action"])
 
-                has_after = len(traj["steps"]) > 1
+                has_after = len(traj["steps"]) > 1 and self._use_after_image
                 if has_after:
                     after_image = self._load_image(traj["steps"][1]["image"])
                     images = [before_image, after_image]
@@ -237,7 +239,7 @@ class RRGReplayEnv:
                 action_str = json.dumps(next_step["action"])
 
                 # Include after-action screenshot if the step after next exists
-                has_after = next_step_idx + 1 < len(traj["steps"])
+                has_after = next_step_idx + 1 < len(traj["steps"]) and self._use_after_image
                 if has_after:
                     after_step = traj["steps"][next_step_idx + 1]
                     after_image = self._load_image(after_step["image"])
@@ -287,6 +289,7 @@ def build_rrg_envs(
     group_n: int,
     is_train: bool = True,
     target_image_size=None,
+    use_after_image: bool = True,
     **kwargs,
 ) -> RRGReplayEnv:
     """Factory function to create an RRG replay environment."""
@@ -297,4 +300,5 @@ def build_rrg_envs(
         group_n=group_n,
         is_train=is_train,
         target_image_size=target_image_size,
+        use_after_image=use_after_image,
     )

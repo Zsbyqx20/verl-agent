@@ -357,3 +357,4 @@ env:
     trajectory_data_path: null  # path to JSON with pre-recorded trajectories
     reasoning_history_length: 5  # max prior reasoning steps in prompt
     target_image_size: null  # "WIDTHxHEIGHT" e.g. "1024x768"; null = no resize
+    use_after_image: true  # whether to include the after-action screenshot in rollout prompts
