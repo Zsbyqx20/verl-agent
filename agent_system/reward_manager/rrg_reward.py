@@ -247,13 +247,16 @@ def _get_client(base_url: str | None) -> Any:
 
 
 @functools.lru_cache(maxsize=None)
-def _encode_image(image_path: str) -> str:
+def _encode_image(image_path: str, target_size: tuple[int, int] | None = None) -> str:
     with Image.open(image_path) as img:
+        if target_size is not None and img.size != target_size:
+            img = img.resize(target_size, Image.Resampling.LANCZOS)
         buf = BytesIO()
         fmt = img.format or "png"
-        img.save(buf, format=fmt)
+        img.save(buf, format="png" if target_size is not None else fmt)
         b64 = base64.b64encode(buf.getvalue()).decode()
-    return f"data:image/{fmt.lower()};base64,{b64}"
+    out_fmt = "png" if target_size is not None else fmt
+    return f"data:image/{out_fmt.lower()};base64,{b64}"
 
 
 _T = TypeVar("_T")
@@ -305,6 +308,7 @@ def call_stage1_final_judge(
     model: str,
     base_url: str | None,
     max_retries: int,
+    target_image_size: tuple[int, int] | None = None,
 ) -> Stage1FinalJudgment:
     bank_text = "empty" if not fact_bank else "\n".join(f"{i}: {obs}" for i, obs in enumerate(fact_bank))
     reasoning_text = "empty" if not action_reasonings else "\n".join(f"{i}: {r}" for i, r in enumerate(action_reasonings))
@@ -333,7 +337,7 @@ def call_stage1_final_judge(
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": user_text},
-                        {"type": "input_image", "image_url": _encode_image(image_path)},
+                        {"type": "input_image", "image_url": _encode_image(image_path, target_image_size)},
                     ],
                 },
             ],
@@ -390,6 +394,7 @@ def call_step_judge(
     model: str,
     base_url: str | None,
     max_retries: int,
+    target_image_size: tuple[int, int] | None = None,
 ) -> StepJudgment:
     bank_text = "empty" if not existing_bank else "\n".join(f"{i}: {obs}" for i, obs in enumerate(existing_bank))
     new_text = "\n".join(f"[{i}] {fact}" for i, fact in enumerate(new_facts))
@@ -405,7 +410,7 @@ def call_step_judge(
                     "role": "user",
                     "content": [
                         {"type": "input_text", "text": user_text},
-                        {"type": "input_image", "image_url": _encode_image(image_path)},
+                        {"type": "input_image", "image_url": _encode_image(image_path, target_image_size)},
                     ],
                 },
             ],
@@ -429,6 +434,7 @@ def call_rank_judge(
     model: str,
     base_url: str | None,
     max_retries: int,
+    target_image_size: tuple[int, int] | None = None,
 ) -> RankJudgment:
     labeled = "\n\n".join(f"[{i}]\n{text}" for i, text in enumerate(reasonings))
     has_after = bool(next_image_path) and os.path.isfile(next_image_path)
@@ -437,11 +443,11 @@ def call_rank_judge(
 
     user_content: list[dict[str, Any]] = [
         {"type": "input_text", "text": user_text},
-        {"type": "input_image", "image_url": _encode_image(image_path)},
+        {"type": "input_image", "image_url": _encode_image(image_path, target_image_size)},
     ]
     if has_after:
         user_content.append(
-            {"type": "input_image", "image_url": _encode_image(next_image_path)}  # type: ignore[arg-type]
+            {"type": "input_image", "image_url": _encode_image(next_image_path, target_image_size)}  # type: ignore[arg-type]
         )
 
     def _call():
@@ -509,6 +515,14 @@ class RRGRewardManager:
         self.log_judge_errors = bool(cfg.get("log_judge_errors", True))
         self.max_judge_error_logs = int(cfg.get("max_judge_error_logs", 20))
         self._judge_error_logs = 0
+
+        raw_size = cfg.get("target_image_size", None)
+        if raw_size is not None:
+            s = str(raw_size).replace("×", "x")
+            parts = s.lower().split("x")
+            self._target_size: tuple[int, int] | None = (int(parts[0]), int(parts[1]))
+        else:
+            self._target_size = None
 
         self._pool: ThreadPoolExecutor | None = None
 
@@ -680,6 +694,7 @@ class RRGRewardManager:
                 self.final_judge_model,
                 self.judge_base_url,
                 self.max_retries,
+                self._target_size,
             )
             stage1_futures[fut] = env_slot
             judge_stats["final_calls"] += 1
@@ -814,6 +829,7 @@ class RRGRewardManager:
                     self.step_judge_model,
                     self.judge_base_url,
                     self.max_retries,
+                    self._target_size,
                 )
                 all_step_futures[fut] = (env_slot, t, len(new_facts))
                 judge_stats["step_calls"] += 1
@@ -904,6 +920,7 @@ class RRGRewardManager:
                         self.rank_judge_model,
                         self.judge_base_url,
                         self.max_retries,
+                        self._target_size,
                     )
                     all_rank_futures[fut] = (uid_str, t, valid_slots)
                     judge_stats["rank_calls"] += 1

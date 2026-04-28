@@ -8,6 +8,24 @@ import numpy as np
 from PIL import Image
 
 
+def _parse_size(value) -> tuple[int, int] | None:
+    """Parse a size spec into a (width, height) tuple.
+
+    Accepts None, a "WxH" / "W×H" string, or a 2-element sequence.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        w, h = int(value[0]), int(value[1])
+        return (w, h)
+    # string form: "1024x768" or "1024×768"
+    s = str(value).replace("×", "x")
+    parts = s.lower().split("x")
+    if len(parts) != 2:
+        raise ValueError(f"target_image_size must be 'WxH', got {value!r}")
+    return (int(parts[0]), int(parts[1]))
+
+
 class RRGReplayEnv:
     """Trajectory replay environment for the Reverse Reasoning Generator.
 
@@ -39,11 +57,13 @@ class RRGReplayEnv:
         env_num: int,
         group_n: int,
         is_train: bool = True,
+        target_image_size=None,
     ):
         self.batch_size = env_num * group_n
         self.group_n = group_n
         self.env_num = env_num
         self.is_train = is_train
+        self._target_size: tuple[int, int] | None = _parse_size(target_image_size)
         self._rng = np.random.RandomState(seed)
 
         # Load trajectory data
@@ -65,6 +85,8 @@ class RRGReplayEnv:
         if not os.path.isfile(image_path):
             raise FileNotFoundError(f"Screenshot not found: {image_path}")
         img = Image.open(image_path).convert("RGB")
+        if self._target_size is not None and img.size != self._target_size:
+            img = img.resize(self._target_size, Image.Resampling.LANCZOS)
         return np.array(img)
 
     def reset(self, kwargs: list[dict] | None = None) -> tuple[list[str], list[np.ndarray], list[dict]]:
@@ -264,6 +286,7 @@ def build_rrg_envs(
     env_num: int,
     group_n: int,
     is_train: bool = True,
+    target_image_size=None,
     **kwargs,
 ) -> RRGReplayEnv:
     """Factory function to create an RRG replay environment."""
@@ -273,4 +296,5 @@ def build_rrg_envs(
         env_num=env_num,
         group_n=group_n,
         is_train=is_train,
+        target_image_size=target_image_size,
     )

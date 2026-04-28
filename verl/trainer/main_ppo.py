@@ -150,7 +150,9 @@ class TaskRunner:
             val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
         elif reward_manager_name == 'rrg':
             from agent_system.reward_manager.rrg_reward import RRGRewardManager
-            rrg_cfg = OmegaConf.to_container(config.algorithm.rrg, resolve=True)
+            rrg_cfg: dict = OmegaConf.to_container(config.algorithm.rrg, resolve=True)  # type: ignore[assignment]
+            env_rrg_cfg: dict = OmegaConf.to_container(config.env.rrg, resolve=True)  # type: ignore[assignment]
+            rrg_cfg["target_image_size"] = env_rrg_cfg.get("target_image_size", None)
             reward_fn = RRGRewardManager(tokenizer=tokenizer, num_examine=0, config=rrg_cfg, envs=envs)
             val_reward_fn = RRGRewardManager(tokenizer=tokenizer, num_examine=1, config=rrg_cfg, envs=val_envs)
         else:

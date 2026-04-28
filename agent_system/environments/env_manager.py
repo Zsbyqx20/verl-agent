@@ -937,8 +937,9 @@ def make_envs(config):
     elif "rrg" in config.env.env_name.lower():
         from agent_system.environments.env_package.rrg import build_rrg_envs, rrg_projection
         trajectory_data_path = config.env.rrg.trajectory_data_path
-        _envs = build_rrg_envs(trajectory_data_path=trajectory_data_path, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True)
-        _val_envs = build_rrg_envs(trajectory_data_path=trajectory_data_path, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False)
+        target_image_size = config.env.rrg.get("target_image_size", None)
+        _envs = build_rrg_envs(trajectory_data_path=trajectory_data_path, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, target_image_size=target_image_size)
+        _val_envs = build_rrg_envs(trajectory_data_path=trajectory_data_path, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, target_image_size=target_image_size)
 
         projection_f = partial(rrg_projection)
         envs = RRGEnvironmentManager(_envs, projection_f, config)
