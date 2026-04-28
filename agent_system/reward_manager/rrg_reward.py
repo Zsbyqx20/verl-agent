@@ -436,12 +436,12 @@ def call_rank_judge(
     user_text = f"Task Goal: {task}\nGround Truth Next Action: {ground_truth_action}\n{image_note}\nCandidate reasonings (N={len(reasonings)}):\n\n{labeled}"
 
     user_content: list[dict[str, Any]] = [
-        {"type": "text", "text": user_text},
-        {"type": "image_url", "image_url": {"url": _encode_image(image_path)}},
+        {"type": "input_text", "text": user_text},
+        {"type": "input_image", "image_url": _encode_image(image_path)},
     ]
     if has_after:
         user_content.append(
-            {"type": "image_url", "image_url": {"url": _encode_image(next_image_path)}}  # type: ignore[arg-type]
+            {"type": "input_image", "image_url": _encode_image(next_image_path)}  # type: ignore[arg-type]
         )
 
     def _call():
