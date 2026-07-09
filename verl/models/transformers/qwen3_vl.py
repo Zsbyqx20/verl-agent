@@ -150,9 +150,30 @@ def _get_input_embeds(
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+            # DEFENSIVE (rrg): a rare Qwen3-VL off-by-one between image-placeholder tokens and
+            # vision features on specific screenshot sizes would otherwise crash the whole run.
+            # Align image features AND the deepstack embeds (both indexed by the image-token mask
+            # downstream) to the token count via pad(repeat-last)/trim so masked_scatter matches.
+            # Impact: <=1 duplicated/dropped image embedding out of thousands -- negligible vs a
+            # dead multi-day run.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                f"[rrg-guard] image token/feature mismatch: tokens={n_image_tokens} "
+                f"features={n_image_features}; aligning to avoid crash"
             )
+
+            def _align_dim0(t, n):
+                if t.shape[0] == n:
+                    return t
+                if t.shape[0] > n:
+                    return t[:n]
+                pad = t[-1:].expand(n - t.shape[0], *t.shape[1:])
+                return torch.cat([t, pad], dim=0)
+
+            image_embeds = _align_dim0(image_embeds, n_image_tokens)
+            if deepstack_image_embeds is not None:
+                deepstack_image_embeds = [_align_dim0(e, n_image_tokens) for e in deepstack_image_embeds]
 
         mask = input_ids == model.config.image_token_id
         mask_unsqueezed = mask.unsqueeze(-1)

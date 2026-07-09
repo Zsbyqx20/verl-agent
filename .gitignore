@@ -132,3 +132,10 @@ data/
 .tmp
 *ports
 
+# rrg-native: generated artifacts, not code
+merged/
+patched_policy/
+rollout_dumps/
+gpu_util_teacher_v1.csv
+swanlog/
+

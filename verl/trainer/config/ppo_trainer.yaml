@@ -265,6 +265,7 @@ trainer:
   logger: [ 'console', 'wandb' ]
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
+  rollout_data_max_dump: 0 # cap rows dumped per step (top+bottom by score); 0/null = all
   validation_data_dir: null # directory for logging the validation data, no dump if null
   nnodes: 1
   n_gpus_per_node: 8
@@ -314,3 +315,66 @@ env:
   webshop:
     use_small: True
     human_goals: False
+  rrg:
+    # frozen reader serving the two-channel reward (step margin + trajectory answer-recovery)
+    reader_url: "http://117.74.66.190:10727/v1"
+    reader_model: "Qwen/Qwen3-VL-8B-Instruct"
+    reader_key: "sk-dummy"     # api key for the train reader (8B is unauthenticated)
+    # Separate reader for the VAL answer-checker only (env_manager terminal correctness).
+    # Lets val use a stronger/slower model (e.g. doubao via Ark) without slowing the per-step
+    # train reward, which stays on reader_url (logprobs needed for the step margin). null ->
+    # fall back to reader_url/reader_model/answer_max_tokens.
+    val_reader_url: null
+    val_reader_model: null
+    val_reader_key: "sk-dummy"
+    val_answer_max_tokens: null
+    # data_kind selects the episode source / trajectory reward:
+    #   amex -> flat jsonl, completion-judge trajectory reward (legacy navigation toy)
+    #   rrg  -> native answer-bearing task_root tree, generative answer-recovery recall reward
+    data_kind: amex
+    # --- amex (legacy) source ---
+    train_jsonl: "${oc.env:HOME}/ReverseReasoningGenerator/data/amex_reason_test.jsonl"
+    train_image_root: "${oc.env:HOME}/ReverseReasoningGenerator/data/sft/amex_test_images"
+    val_jsonl: null            # defaults to train_jsonl
+    val_image_root: null       # defaults to train_image_root
+    # --- rrg (answer-recovery) source: directory trees with tasks.json + rrg-source.csv + params_cache.json ---
+    train_task_root: "${oc.env:HOME}/ReverseReasoningGenerator/data/rrg-train"
+    val_task_root: "${oc.env:HOME}/ReverseReasoningGenerator/data/rrg-val"
+    answer_max_tokens: 2048    # reader max_tokens for the generative answer assembly (bumped
+                               # 1024->2048: 1024 truncated ~11% of assemblies on the 8B reader,
+                               # zeroing those trajectory rewards; see rrg-reader-bottleneck)
+    num_episodes: null         # null = all; set to a small int for the toy
+    val_num_episodes: null
+    num_distractors: 4         # K-1 hard distractors for the step action-recovery margin
+    max_image_long: 768        # reader-side screenshot downscale
+    coord_tol: 8               # px tolerance for the coordinate-leakage veto
+    concurrency: 64            # async reward calls in flight
+    subtract_control: false    # subtract a content-free control from the step margin
+    system_prompt_file: null   # match the SFT system prompt (prompts/system_amex.txt)
+    # Teacher-demo injection (EXPLORATION): seed the first teacher_seed_k slots of each group with a
+    # verified teacher trajectory so the policy learns note-taking it can't produce on its own. TRAIN only.
+    teacher_data_path: null    # json {task_id 'env-tid' -> [per-step reasoning]}; null = off
+    teacher_seed_k: 0          # # of the group's G slots to teacher-force (0 = off, e.g. 1 of 8)
+    teacher_anneal_end_step: null  # stop teacher injection after this many training steps (null = never)
+    # --- trajectory reward shaping (#3): transform raw answer-recovery recall before it
+    # becomes the GiGPO macro reward. Raw recall/correct are still logged unchanged.
+    #   none         -> reward = recall (current behavior)
+    #   square       -> reward = recall ** shaping_power (convex: pays for the LAST fields)
+    #   correct_bonus-> reward = recall + correct_bonus_lambda * correct
+    #   threshold    -> reward = recall + threshold_bonus if recall >= recall_threshold else recall
+    traj_reward_shaping: none
+    shaping_power: 2.0
+    correct_bonus_lambda: 0.5
+    recall_threshold: 0.9
+    threshold_bonus: 0.5
+    # --- per-step answer-field credit (GiGPO MICRO channel) ---
+    # Reward each step for the gold answer-fields that FIRST become recoverable from the notes
+    # at that step (per-field temporal credit assignment). The blind reader assembles the answer
+    # from note PREFIXES; the marginal recall at step t enters non_tensor_batch['rewards'].
+    # Off by default => byte-identical to the plain-recall run.
+    answer_step_credit: false
+    step_credit_w: 1.0                  # weight of the answer credit within the micro channel
+    step_credit_mode: first_appearance  # first_appearance | delta
+    step_credit_combine: add            # add (to action margin) | replace
+    max_prefixes: 8                     # cap reader prefix-assembles per trajectory (subsample beyond)
+    clamp_negative: true                # clamp per-step credit to >=0 (delta-mode flicker guard)

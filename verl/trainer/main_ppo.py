@@ -145,14 +145,54 @@ class TaskRunner:
         reward_manager_name = config.reward_model.get("reward_manager", "episode")
         if reward_manager_name == 'episode':
             from agent_system.reward_manager import EpisodeRewardManager
-            reward_manager_cls = EpisodeRewardManager
+            reward_fn = EpisodeRewardManager(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
+            # Note that we always use function-based RM for validation
+            val_reward_fn = EpisodeRewardManager(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
+        elif reward_manager_name == 'rrg':
+            # RRG trajectory/macro reward = generative answer-recovery recall (the env supplies the
+            # step/micro action-recovery margin). The blind 8B reader assembles the gold-schema
+            # answer from the policy's reasonings; recall in [0,1] is the macro reward.
+            from agent_system.reward_manager import RRGTrajectoryRewardManager
+            rcfg = config.env.rrg
+            common = dict(concurrency=rcfg.get('concurrency', 64),
+                          data_kind=rcfg.get('data_kind', 'amex'),
+                          train_task_root=rcfg.get('train_task_root', None),
+                          val_task_root=rcfg.get('val_task_root', None))
+            # Train macro reward: 8B reader (logprobs path shares this host), bumped token
+            # budget, and the completeness shaping (#3) applied to the reward written to the
+            # tensor. Raw recall/correct are still logged unchanged.
+            reward_fn = RRGTrajectoryRewardManager(
+                tokenizer=tokenizer, num_examine=0, is_val=False,
+                reader_url=rcfg.reader_url, reader_model=rcfg.reader_model,
+                reader_key=rcfg.get('reader_key', 'sk-dummy'),
+                answer_max_tokens=rcfg.get('answer_max_tokens', 2048),
+                traj_reward_shaping=rcfg.get('traj_reward_shaping', 'none'),
+                shaping_power=rcfg.get('shaping_power', 2.0),
+                correct_bonus_lambda=rcfg.get('correct_bonus_lambda', 0.5),
+                recall_threshold=rcfg.get('recall_threshold', 0.9),
+                threshold_bonus=rcfg.get('threshold_bonus', 0.5),
+                answer_step_credit=rcfg.get('answer_step_credit', False),
+                step_credit_w=rcfg.get('step_credit_w', 1.0),
+                step_credit_mode=rcfg.get('step_credit_mode', 'first_appearance'),
+                step_credit_combine=rcfg.get('step_credit_combine', 'add'),
+                max_prefixes=rcfg.get('max_prefixes', 8),
+                clamp_negative=rcfg.get('clamp_negative', True),
+                **common)
+            # Val/eval reward: optional stronger reader (doubao) for an accurate test_score,
+            # and shaping FORCED OFF so val/rrg/test_score stays raw recall (a comparable metric).
+            v_url = rcfg.get('val_reader_url', None) or rcfg.reader_url
+            v_model = rcfg.get('val_reader_model', None) or rcfg.reader_model
+            # Prefer the key from the environment (RRG_VAL_READER_KEY) so the secret never
+            # enters the Hydra config tree -- which verl prints to stdout AND uploads to swanlab.
+            v_key = (os.environ.get('RRG_VAL_READER_KEY')
+                     or rcfg.get('val_reader_key', None) or rcfg.get('reader_key', 'sk-dummy'))
+            v_max = rcfg.get('val_answer_max_tokens', None) or rcfg.get('answer_max_tokens', 2048)
+            val_reward_fn = RRGTrajectoryRewardManager(
+                tokenizer=tokenizer, num_examine=1, is_val=True,
+                reader_url=v_url, reader_model=v_model, reader_key=v_key,
+                answer_max_tokens=v_max, traj_reward_shaping='none', **common)
         else:
             raise NotImplementedError
-
-        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
-
-        # Note that we always use function-based RM for validation
-        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

@@ -19,6 +19,9 @@ import torch
 import numpy as np
 from functools import partial
 import os
+import re
+import json
+from PIL import Image
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory, SearchMemory
@@ -599,6 +602,220 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+
+RRG_LANG_NAME = {"en": "English", "zh": "Chinese", "es": "Spanish", "fr": "French",
+                 "de": "German", "ja": "Japanese", "ko": "Korean", "pt": "Portuguese"}
+
+
+class RRGEnvironmentManager(EnvironmentManagerBase):
+    """Reverse-reasoning REPLAY manager (AMEX navigation toy).
+
+    The policy generates the per-step REASONING (it is shown the goal, history of its OWN
+    prior reasonings, the GT next action, and the marked screenshot). The action is replayed,
+    so this manager's job each step is: (1) score the action-recovery MARGIN of the generated
+    reasoning with the frozen 8B reader (the GiGPO step/micro reward); (2) apply the
+    leakage/restatement VETO (reasoning that restates the GT coordinates -> invalid ->
+    invalid_action_penalty); (3) thread the generated reasoning forward as own-notes history;
+    (4) advance the replay. anchor = "task_id:step_idx" -> exact GiGPO step grouping.
+    The trajectory/macro reward (completion judge) is computed post-rollout in the reward manager.
+    """
+
+    def __init__(self, envs, projection_f, config):
+        self.is_multi_modal = True
+        self.memory = SimpleMemory()
+        self.history = None  # per-slot list of generated reasonings (SFT 'Step k:' format)
+        self.cur_frames = None
+
+        rcfg = config.env.rrg
+        from agent_system.environments.env_package.rrg.reward_client import RRGRewardClient, action_str
+        self._action_str = action_str
+        self.reward_client = RRGRewardClient(
+            base_url=rcfg.reader_url, model_name=rcfg.reader_model,
+            max_image_long=rcfg.get("max_image_long", 768),
+            num_distractors=rcfg.get("num_distractors", 4),
+            concurrency=rcfg.get("concurrency", 64),
+            subtract_control=rcfg.get("subtract_control", False))
+        self.coord_tol = rcfg.get("coord_tol", 8)
+        # Val answer-checker: only the val replay env (is_train=False) computes terminal
+        # answer-recovery correctness for success_rate; train relies on the reward manager's
+        # recall, so we skip the extra reader call there.
+        self.data_kind = rcfg.get("data_kind", "amex")
+        self.answer_check = (self.data_kind == "rrg") and (not getattr(envs, "is_train", True))
+        self.answer_max_tokens = rcfg.get("answer_max_tokens", 2048)
+        # The val answer-check may use a separate, stronger/slower reader (e.g. doubao via Ark)
+        # for a more accurate success metric. Step margins ALWAYS stay on reward_client (the 8B):
+        # the margin needs the logprobs path, which the doubao reasoning model does not expose.
+        self.answer_client = self.reward_client
+        if self.answer_check and rcfg.get("val_reader_url", None):
+            self.answer_client = RRGRewardClient(
+                base_url=rcfg.val_reader_url,
+                model_name=rcfg.get("val_reader_model", None) or rcfg.reader_model,
+                concurrency=rcfg.get("concurrency", 64),
+                # key from env (RRG_VAL_READER_KEY) so it stays out of the logged/uploaded config.
+                api_key=(os.environ.get("RRG_VAL_READER_KEY")
+                         or rcfg.get("val_reader_key", None) or "sk-dummy"))
+            self.answer_max_tokens = rcfg.get("val_answer_max_tokens", None) or self.answer_max_tokens
+
+        self.system_prompt = ""
+        spf = rcfg.get("system_prompt_file", None)
+        if spf and os.path.isfile(spf):
+            with open(spf, encoding="utf-8") as f:
+                self.system_prompt = f.read().strip()
+
+        # global hard-distractor pool: every GT action string across the loaded episodes
+        self.action_pool = sorted({action_str(fr["action"])
+                                   for ep in envs.episodes for fr in ep["frames"]})
+
+        # Teacher-demo injection (EXPLORATION): seed the first `teacher_seed_k` slots of each group of
+        # `group_n` with a verified teacher trajectory (task_id 'env-tid' -> [per-step reasoning]). The
+        # rollout loop forces these into the response, so the (high-reward) teacher trajectory enters its
+        # GiGPO group and pulls the policy toward note-taking it cannot produce on its own. TRAIN only,
+        # off by default. Group size = config.env.rollout.n (matches the uid grouping in rollout_loop).
+        self.teacher_store = {}
+        tdp = rcfg.get("teacher_data_path", None)
+        if tdp and os.path.isfile(tdp):
+            with open(tdp, encoding="utf-8") as f:
+                self.teacher_store = json.load(f)
+        self.teacher_seed_k = int(rcfg.get("teacher_seed_k", 0))
+        self.teacher_anneal_end_step = rcfg.get("teacher_anneal_end_step", None)
+        self.group_n = int(getattr(config.env.rollout, "n", 0)) or int(getattr(envs, "group_n", 1))
+        self.is_train_env = bool(getattr(envs, "is_train", True))
+        self._reset_count = 0
+        if self.teacher_store and self.teacher_seed_k > 0 and self.is_train_env:
+            print(f"[rrg-teacher] loaded {len(self.teacher_store)} teacher trajectories; seeding "
+                  f"{self.teacher_seed_k}/{self.group_n} slots per group"
+                  + (f"; anneal off after {self.teacher_anneal_end_step} steps"
+                     if self.teacher_anneal_end_step else ""))
+        super().__init__(envs, projection_f, config)
+
+    # ----- helpers ----- #
+    def _load_img(self, path):
+        return np.array(Image.open(path).convert("RGB"), dtype=np.uint8)
+
+    def _anchor(self, fr):
+        return f"{fr['task_id']}:{fr['step_idx']}"
+
+    def _coord_leak(self, text, action):
+        """Leakage veto: reasoning restates the GT click coordinate (within coord_tol px)."""
+        if action.get("action") != "click":
+            return False
+        gx, gy = action["coordinate"]
+        for m in re.finditer(r"\(?\s*(\d{2,4})\s*[,/x ]\s*(\d{2,4})\s*\)?", text or ""):
+            x, y = int(m.group(1)), int(m.group(2))
+            if abs(x - gx) <= self.coord_tol and abs(y - gy) <= self.coord_tol:
+                return True
+        return False
+
+    def _forced_responses(self, frames):
+        """Per-slot teacher text for teacher-seeded slots (TRAIN only), else None per slot. Returns None
+        (whole list) when teacher injection is inactive, so the rollout-loop splice is a pure no-op."""
+        if not (self.teacher_store and self.teacher_seed_k > 0 and self.is_train_env):
+            return None
+        if self.teacher_anneal_end_step is not None and self._reset_count >= self.teacher_anneal_end_step:
+            return None
+        out = []
+        for i, fr in enumerate(frames):
+            text = None
+            if (i % self.group_n) < self.teacher_seed_k:           # first k slots of each uid group
+                traj = self.teacher_store.get(str(fr["task_id"]))   # verified tasks only
+                si = fr["step_idx"]
+                if traj is not None and si < len(traj):
+                    text = traj[si]
+            out.append(text)
+        return out
+
+    def _obs(self, frames):
+        obs = {
+            'text': self.build_text_obs(frames),
+            'image': [self._load_img(fr["image_path"]) for fr in frames],
+            'anchor': [self._anchor(fr) for fr in frames],
+        }
+        forced = self._forced_responses(frames)
+        if forced is not None:
+            obs['forced_response'] = forced
+        return obs
+
+    # ----- gym-like API ----- #
+    def reset(self, kwargs):
+        obs_list, infos = self.envs.reset()
+        self.cur_frames = obs_list
+        self.history = [[] for _ in range(len(obs_list))]
+        self.memory.reset(batch_size=len(obs_list))
+        self._reset_count += 1  # ~one reset per training step; drives teacher anneal
+        obs = self._obs(obs_list)
+        if obs.get('forced_response'):
+            n_teacher = sum(1 for x in obs['forced_response'] if x)
+            print(f"[rrg-teacher] reset {self._reset_count}: {n_teacher} teacher-forced slots", flush=True)
+        return obs, infos
+
+    def step(self, text_actions: List[str]):
+        text_actions = list(text_actions)
+        actions, valids = self.projection_f(text_actions)
+        frames = self.cur_frames
+
+        # (1) per-step action-recovery margin (reader SEES the current screenshot)
+        items = [{"goal": fr["goal"], "image": fr["image_path"], "action": fr["action"],
+                  "reasoning": text_actions[i]} for i, fr in enumerate(frames)]
+        rewards = np.asarray(self.reward_client.score_step_margins(items, self.action_pool),
+                             dtype=np.float32)
+
+        # (2) leakage veto folded into validity
+        for i, fr in enumerate(frames):
+            leaked = self._coord_leak(text_actions[i], fr["action"])
+            valids[i] = 1 if (valids[i] and not leaked) else 0
+
+        # (3) own-notes history forward
+        for i in range(len(frames)):
+            self.history[i].append(text_actions[i].strip())
+
+        # (4) advance the replay
+        next_obs_list, _, dones, infos = self.envs.step(actions)
+        self.cur_frames = next_obs_list
+        for i, info in enumerate(infos):
+            info['is_action_valid'] = to_numpy(valids[i])
+
+        # (5) val answer-checker: on a finished episode, assemble the answer from the policy's
+        # own reasonings (blind reader) and mark won iff it fully recovers gold. Train skips
+        # this (success not used there); the reward manager handles recall for the macro reward.
+        if self.answer_check and any(bool(d) for d in dones):
+            done_idx = [i for i, d in enumerate(dones) if bool(d)]
+            items = []
+            for i in done_idx:
+                fr = frames[i]  # frame just acted on carries this task's goal/gold/schema
+                items.append({"goal": fr["goal"], "reasonings": list(self.history[i]),
+                              "gold": fr.get("gold"), "schema": fr.get("schema")})
+            scorable = [j for j, it in enumerate(items) if it["gold"] and it["schema"]]
+            if scorable:
+                scored = self.answer_client.score_traj_recovery(
+                    [items[j] for j in scorable], max_tokens=self.answer_max_tokens)
+                res_by_local = {j: r for j, r in zip(scorable, scored)}
+                for local, i in enumerate(done_idx):
+                    r = res_by_local.get(local)
+                    if r is not None:
+                        infos[i]['won'] = bool(r["correct"])
+
+        return self._obs(next_obs_list), to_numpy(rewards), to_numpy(dones), infos
+
+    def build_text_obs(self, frames, *args, **kwargs) -> List[str]:
+        """Match the SFT prompt (prompts/system_amex.txt + amex_to_sft.build_user_text) so the
+        SFT-initialized policy stays in-distribution. Own prior reasonings form the history."""
+        out = []
+        for i, fr in enumerate(frames):
+            hist = self.history[i] if self.history else []
+            hist_str = "\n".join(f"Step {k + 1}: {r}" for k, r in enumerate(hist)) \
+                or "(none yet -- this is the first step)"
+            lang = RRG_LANG_NAME.get(fr.get("lang", "en"), "English")
+            user = (
+                f"# Task goal\n{fr['goal']}\n\n"
+                f"# Your reasoning in previous steps\n{hist_str}\n\n"
+                f"# Ground-truth next action\n{json.dumps(fr['action'], ensure_ascii=False)}\n\n"
+                f"# Output language\nWrite the reasoning chain in {lang}, to match the app.\n\n"
+                "<image>"
+            )
+            out.append((self.system_prompt + "\n\n" + user) if self.system_prompt else user)
+        return out
+
+
 def make_envs(config):
     """
     Create enviroments 
@@ -693,6 +910,54 @@ def make_envs(config):
         projection_f = partial(appworld_projection)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
+        return envs, val_envs
+    elif "rrg" in config.env.env_name.lower():
+        from agent_system.environments.env_package.rrg import build_rrg_envs, rrg_projection
+        rcfg = config.env.rrg
+        data_kind = rcfg.get('data_kind', 'amex')
+        if data_kind == 'rrg':
+            # Native RRG: answer-bearing tasks served from a task_root directory tree.
+            env_kwargs = {
+                'data_kind': 'rrg',
+                'task_root': rcfg.train_task_root,
+                'num_episodes': rcfg.get('num_episodes', None),
+            }
+            val_task_root = rcfg.get('val_task_root', None) or rcfg.train_task_root
+            val_num_eps = rcfg.get('val_num_episodes', None)
+            if val_num_eps is None:
+                val_num_eps = rcfg.get('num_episodes', None)
+            val_kwargs = {
+                'data_kind': 'rrg',
+                'task_root': val_task_root,
+                'num_episodes': val_num_eps,
+            }
+        else:
+            env_kwargs = {
+                'data_kind': 'amex',
+                'data_jsonl': rcfg.train_jsonl,
+                'image_root': rcfg.train_image_root,
+                'num_episodes': rcfg.get('num_episodes', None),
+            }
+            # NB: OmegaConf .get() returns the stored value even when it is null, so use explicit
+            # None-fallbacks (val_* default to null in the yaml -> fall back to the train values).
+            val_jsonl = rcfg.get('val_jsonl', None) or rcfg.train_jsonl
+            val_image_root = rcfg.get('val_image_root', None) or rcfg.train_image_root
+            val_num_eps = rcfg.get('val_num_episodes', None)
+            if val_num_eps is None:
+                val_num_eps = rcfg.get('num_episodes', None)
+            val_kwargs = {
+                'data_kind': 'amex',
+                'data_jsonl': val_jsonl,
+                'image_root': val_image_root,
+                'num_episodes': val_num_eps,
+            }
+        _envs = build_rrg_envs(seed=config.env.seed, env_num=config.data.train_batch_size,
+                               group_n=group_n, is_train=True, env_kwargs=env_kwargs)
+        _val_envs = build_rrg_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size,
+                                   group_n=1, is_train=False, env_kwargs=val_kwargs)
+        projection_f = partial(rrg_projection)
+        envs = RRGEnvironmentManager(_envs, projection_f, config)
+        val_envs = RRGEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     else:
         print("Environment not supported")

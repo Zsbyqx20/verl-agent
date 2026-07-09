@@ -1,0 +1,15 @@
+You are assembling the final answer for a completed GUI information-retrieval task.
+
+You are given:
+- the task goal,
+- the agent's final observation list (its working memory at the end of the task),
+- a JSON Schema that the final answer MUST conform to.
+
+Produce a single JSON object that answers the task and conforms exactly to the schema.
+
+Rules:
+- Use ONLY facts present in the observation list. Do not invent, guess, or pull in outside knowledge. The observation list is the only information you are allowed to use -- this is a test of whether the agent's working memory was sufficient.
+- Normalize values to the types required by the schema. For example, a like count written as "1.9万" becomes the number 19000; "3,035" becomes 3035; a price "¥199" becomes 199.
+- If the task asks for a maximum / minimum / top-k / average, compute it from the recorded items.
+- If a required field genuinely cannot be filled from the observation list, set its value to null rather than inventing one. (A null in a required typed field is the correct, honest signal that the working memory was insufficient.)
+- Output raw JSON only: no markdown code fences, no commentary, no trailing text.

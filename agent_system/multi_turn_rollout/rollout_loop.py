@@ -282,9 +282,49 @@ class TrajectoryCollector:
         )
         return gen_batch_output
 
+    def _splice_forced_responses(self, batch, obs):
+        """Teacher-demo injection: overwrite the response of any slot whose obs carries a non-empty
+        'forced_response' string, so (a) tokenizer.batch_decode(responses) yields the teacher text and
+        (b) the actor's compute_log_prob scores the policy's likelihood of those teacher tokens.
+
+        Generic — only acts when obs supplies 'forced_response'; no env-specific logic here. Both the
+        generated and teacher responses are text continuations of the SAME prompt, so the response-region
+        position_ids are content-independent sequential offsets and are left intact (sidesteps Qwen3-VL
+        3D mrope). Only responses / input_ids[response] / attention_mask[response] change. Returns the
+        number of slots spliced. Edits tensor contents in place (no TensorDict key changes)."""
+        forced = obs.get('forced_response') if isinstance(obs, dict) else None
+        if not forced:
+            return 0
+        responses = batch.batch['responses']
+        input_ids = batch.batch['input_ids']
+        attn = batch.batch['attention_mask']
+        resp_len = responses.shape[1]
+        prompt_len = input_ids.shape[1] - resp_len
+        pad_id = self.tokenizer.pad_token_id
+        eos_id = self.tokenizer.eos_token_id
+        dev, dt = responses.device, responses.dtype
+        n = 0
+        for i in range(responses.shape[0]):
+            text = forced[i] if i < len(forced) else None
+            if not text:
+                continue
+            ids = self.tokenizer.encode(text, add_special_tokens=False)[:resp_len - 1]
+            if eos_id is not None:
+                ids = ids + [eos_id]          # match generated responses (EOS-terminated, then padded)
+            ids = ids[:resp_len]
+            vlen = len(ids)
+            row = torch.full((resp_len,), pad_id, dtype=dt, device=dev)
+            row[:vlen] = torch.tensor(ids, dtype=dt, device=dev)
+            responses[i] = row
+            input_ids[i, prompt_len:] = row
+            attn[i, prompt_len:] = 0
+            attn[i, prompt_len:prompt_len + vlen] = 1
+            n += 1
+        return n
+
     def vanilla_multi_turn_loop(
             self,
-            gen_batch: DataProto, 
+            gen_batch: DataProto,
             actor_rollout_wg, 
             envs: EnvironmentManagerBase,
             ) -> DataProto:
@@ -349,19 +389,48 @@ class TrajectoryCollector:
 
             batch_input.meta_info = gen_batch.meta_info
 
-            # pad to be divisible by dp_size
-            batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
-            batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
-            # # unpad
-            batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+            # Only generate for environments that are still active. Finished (done)
+            # environments would otherwise be re-decoded against their clamped terminal
+            # frame every turn and then discarded downstream (gather_rollout_data keeps
+            # only active_masks rows), so generating them is pure wasted GPU time. With
+            # skewed episode lengths a single long trajectory drags all finished envs
+            # along, making generation scale with the longest episode in the batch.
+            # Skipping done rows is a performance-only change: the surviving training
+            # batch is identical (done rows are filtered out before loss either way).
+            num_active = int(active_masks.sum())
+            if num_active == batch_size:
+                # Fast path: nothing finished yet, behave exactly as before.
+                batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
+                batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
+                batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+            else:
+                # Generate only active rows, then scatter results back to full batch_size
+                # so the downstream union/decode/bookkeeping stays shape-aligned. Done
+                # rows are filled with a placeholder duplicate of an active row; they are
+                # marked active_masks=False below and dropped in gather_rollout_data.
+                active_input = batch_input.select_idxs(active_masks)
+                active_input.meta_info = gen_batch.meta_info
+                active_padded, pad_size = pad_dataproto_to_divisor(active_input, actor_rollout_wg.world_size)
+                active_output_padded = actor_rollout_wg.generate_sequences(active_padded)
+                active_output = unpad_dataproto(active_output_padded, pad_size=pad_size)
+                # gather_back[i] = row in active_output for full position i (0 for done -> placeholder)
+                active_positions = np.nonzero(active_masks)[0]
+                gather_back = np.zeros(batch_size, dtype=np.int64)
+                gather_back[active_positions] = np.arange(num_active)
+                batch_output = active_output.select_idxs(gather_back)
 
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
 
             batch = batch.union(batch_output)
-            
+
+            # Teacher-demo injection: replace the generated response of teacher-seeded slots with the
+            # forced teacher text BEFORE decode/step, so the teacher reasoning flows into the reward and
+            # the (high-reward) teacher trajectory enters its GiGPO group. No-op unless obs supplies it.
+            self._splice_forced_responses(batch, obs)
+
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
-            
+
             next_obs, rewards, dones, infos = envs.step(text_actions)
 
             

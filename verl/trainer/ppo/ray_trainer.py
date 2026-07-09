@@ -223,6 +223,61 @@ def apply_invalid_action_penalty(data: DataProto, invalid_action_penalty_coef=fl
     metrics = {'episode/valid_action_ratio': valid_action_ratio}
     return data, metrics
 
+def _compute_rrg_reward_metrics(batch: DataProto) -> dict:
+    """RRG-specific reward diagnostics from per-row columns already in non_tensor_batch.
+
+    These distinguish the two failure modes a flat critic/score/mean cannot:
+      - within-group spread of answer_recall (GiGPO's trajectory-channel gradient
+        magnitude). Collapsing toward 0 => stuck (zero-variance groups, no gradient);
+        healthy spread + flat mean => optimization problem, not a gradient problem.
+      - zero_variance_group_fraction: directly the share of uid-groups with no signal.
+      - restatement_rate: leakage / reward-hacking alarm (1 - valid_action_ratio).
+      - train answer_recall / answer_correct means: dense + binary research metric on
+        TRAIN (val already reports these), so trend is visible every step not every test_freq.
+    Best-effort: returns {} if the columns are absent (e.g. non-rrg reward manager).
+    """
+    ntb = batch.non_tensor_batch
+    if "answer_recall" not in ntb or "uid" not in ntb:
+        return {}
+    metrics = {}
+    recall = np.asarray(ntb["answer_recall"], dtype=np.float32)
+    uids = np.asarray(ntb["uid"], dtype=object)
+    metrics["rrg/answer_recall/mean"] = float(recall.mean())
+    if "answer_correct" in ntb:
+        metrics["rrg/answer_correct/mean"] = float(np.asarray(ntb["answer_correct"], dtype=np.float32).mean())
+    if "is_action_valid" in ntb:
+        valid = np.asarray(ntb["is_action_valid"]).astype(np.float32)
+        metrics["rrg/restatement_rate"] = float((1.0 - valid).mean())
+    # Per-uid-group spread of recall (one value per group; rows in a group share recall,
+    # so collapse to the group's unique value via first occurrence).
+    group_stds, group_means, n_zero = [], [], 0
+    for u in set(uids.tolist()):
+        gr = recall[uids == u]
+        s = float(gr.std())
+        group_stds.append(s)
+        group_means.append(float(gr.mean()))
+        if s < 1e-6:
+            n_zero += 1
+    if group_stds:
+        metrics["rrg/group_recall_std/mean"] = float(np.mean(group_stds))
+        metrics["rrg/group_recall_std/max"] = float(np.max(group_stds))
+        metrics["rrg/zero_variance_group_fraction"] = float(n_zero / len(group_stds))
+        metrics["rrg/group_recall_mean/std"] = float(np.std(group_means))  # cross-task difficulty spread
+    # Per-step answer-field credit diagnostics (only present when answer_step_credit is on).
+    if "answer_step_credit" in ntb:
+        metrics["rrg/step_credit/mean"] = float(np.asarray(ntb["answer_step_credit"], dtype=np.float32).mean())
+    if "answer_reader_calls" in ntb:
+        metrics["rrg/reader_calls/mean"] = float(np.asarray(ntb["answer_reader_calls"], dtype=np.float32).mean())
+    if "answer_temporal" in ntb:
+        # fraction of TRAJECTORIES (uid-groups) where some field's first-recovery step > 0
+        # (credit actually distributed across steps, not all dumped at step 0). Per-traj value
+        # is broadcast to its rows, so take each group's mean (== its constant value).
+        temporal = np.asarray(ntb["answer_temporal"], dtype=np.float32)
+        vals = [float(temporal[uids == u].mean()) for u in set(uids.tolist())]
+        if vals:
+            metrics["rrg/temporal_credit_fraction"] = float(np.mean(vals))
+    return metrics
+
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
 
@@ -655,10 +710,22 @@ class RayPPOTrainer:
             if len(v) == n:
                 base_data[k] = v
 
+        def _to_jsonable(o):
+            # reward_extra_infos columns are numpy arrays -> per-row values are numpy scalars
+            # (np.float32/int64/bool_), which json cannot serialize natively.
+            if hasattr(o, "item"):
+                try:
+                    return o.item()
+                except Exception:
+                    pass
+            if hasattr(o, "tolist"):
+                return o.tolist()
+            return str(o)
+
         with open(filename, "w") as f:
             for i in range(n):
                 entry = {k: v[i] for k, v in base_data.items()}
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(json.dumps(entry, ensure_ascii=False, default=_to_jsonable) + "\n")
 
         print(f"Dumped generations to {filename}")
 
@@ -1108,13 +1175,11 @@ class RayPPOTrainer:
                     del batch
                     batch = gen_batch_output
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
-                        step_rewards_tensor = core_gigpo.compute_step_discounted_returns(
-                            batch=batch,
-                            gamma=self.config.algorithm.gamma
-                        )
-                        batch.batch['step_rewards'] = step_rewards_tensor
-                    
+                    # NOTE: GiGPO step_rewards are built AFTER the reward manager runs (moved to
+                    # the adv block below), so the rrg reward manager can inject per-step
+                    # answer-field credit into non_tensor_batch['rewards'] first. adjust_batch /
+                    # _balance_batch keep rewards/traj_uid/active_masks row-aligned, so building
+                    # step_rewards later is equivalent (and required for the credit to be seen).
                     batch = adjust_batch(self.config, batch)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1200,6 +1265,12 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        # GiGPO MICRO channel: build step_rewards now, AFTER the reward manager has
+                        # (optionally) added per-step answer-field credit to non_tensor_batch['rewards'].
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.GiGPO:
+                            batch.batch['step_rewards'] = core_gigpo.compute_step_discounted_returns(
+                                batch=batch, gamma=self.config.algorithm.gamma)
+
                         # compute rewards. apply_invalid_action_penalty if available
                         if self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', True):
                             batch, invalid_metrics = apply_invalid_action_penalty(batch,
@@ -1255,15 +1326,25 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         with _timer("dump_rollout_generations", timing_raw):
-                            print(batch.batch.keys())
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            # Surface the most informative rows: highest scorers (where reward
+                            # hacking / leakage shows up) and lowest (stuck groups), instead of an
+                            # unsorted wall. Cap via trainer.rollout_data_max_dump (0/None = all).
+                            max_dump = self.config.trainer.get("rollout_data_max_dump", 0) or 0
+                            order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+                            if max_dump and len(order) > max_dump:
+                                half = max_dump // 2
+                                order = order[:max_dump - half] + order[len(order) - half:]
+                            sel = lambda seq: [seq[i] for i in order]
+                            dump_extra = {k: sel(list(v)) for k, v in reward_extra_infos_dict.items()
+                                          if len(v) == len(scores)}
                             self._dump_generations(
-                                inputs=inputs,
-                                outputs=outputs,
-                                scores=scores,
-                                reward_extra_infos_dict=reward_extra_infos_dict,
+                                inputs=sel(inputs),
+                                outputs=sel(outputs),
+                                scores=sel(scores),
+                                reward_extra_infos_dict=dump_extra,
                                 dump_path=rollout_data_dir,
                             )
 
@@ -1289,6 +1370,7 @@ class RayPPOTrainer:
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                metrics.update(_compute_rrg_reward_metrics(batch=batch))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
