@@ -67,15 +67,15 @@ class TaskRunner:
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
 
-        from agent_system.environments import make_envs
-        envs, val_envs = make_envs(config)
-
         # instantiate tokenizer
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)  # used for multimodal LLM, could be none
+
+        from agent_system.environments import make_envs
+        envs, val_envs = make_envs(config, tokenizer=tokenizer, processor=processor)
 
         # vllm early verify
         if config.actor_rollout_ref.rollout.name in ["vllm"]:
@@ -177,7 +177,7 @@ class TaskRunner:
                 step_credit_combine=rcfg.get('step_credit_combine', 'add'),
                 max_prefixes=rcfg.get('max_prefixes', 8),
                 clamp_negative=rcfg.get('clamp_negative', True),
-                **common)
+                processor=processor, **common)
             # Val/eval reward: optional stronger reader (doubao) for an accurate test_score,
             # and shaping FORCED OFF so val/rrg/test_score stays raw recall (a comparable metric).
             v_url = rcfg.get('val_reader_url', None) or rcfg.reader_url
@@ -190,7 +190,8 @@ class TaskRunner:
             val_reward_fn = RRGTrajectoryRewardManager(
                 tokenizer=tokenizer, num_examine=1, is_val=True,
                 reader_url=v_url, reader_model=v_model, reader_key=v_key,
-                answer_max_tokens=v_max, traj_reward_shaping='none', **common)
+                answer_max_tokens=v_max, traj_reward_shaping='none',
+                processor=processor, **common)
         else:
             raise NotImplementedError
 

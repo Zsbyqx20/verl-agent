@@ -975,6 +975,15 @@ class RayPPOTrainer:
                 worker_group=self.actor_rollout_wg,
             )
 
+        # Self-judge: inject the vLLM worker group into components that need it for
+        # reward computation (env manager for step margins, reward manager for
+        # trajectory answer-recovery). This replaces the external HTTP reader with
+        # the policy's own vLLM engine when env.rrg.self_judge=True.
+        if self.config.env.get("rrg", {}).get("self_judge", False):
+            for component in [self.envs, self.val_envs, self.reward_fn, self.val_reward_fn]:
+                if component is not None and hasattr(component, 'set_self_judge_wg'):
+                    component.set_self_judge_wg(self.actor_rollout_wg)
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")

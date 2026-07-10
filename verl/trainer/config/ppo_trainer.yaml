@@ -320,6 +320,9 @@ env:
     reader_url: "http://117.74.66.190:10727/v1"
     reader_model: "Qwen/Qwen3-VL-8B-Instruct"
     reader_key: "sk-dummy"     # api key for the train reader (8B is unauthenticated)
+    # Self-judge: when true, both reward channels use the policy's own vLLM engine instead of
+    # an external HTTP reader. No reader_url/model/key needed. Zero external model dependency.
+    self_judge: false
     # Separate reader for the VAL answer-checker only (env_manager terminal correctness).
     # Lets val use a stronger/slower model (e.g. doubao via Ark) without slowing the per-step
     # train reward, which stays on reader_url (logprobs needed for the step margin). null ->

@@ -67,7 +67,7 @@ class RRGTrajectoryRewardManager:
                  threshold_bonus: float = 0.5, answer_step_credit: bool = False,
                  step_credit_w: float = 1.0, step_credit_mode: str = "first_appearance",
                  step_credit_combine: str = "add", max_prefixes: int = 8,
-                 clamp_negative: bool = True, **kwargs) -> None:
+                 clamp_negative: bool = True, processor=None, **kwargs) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.data_kind = data_kind
@@ -88,6 +88,8 @@ class RRGTrajectoryRewardManager:
         self.reward_client = RRGRewardClient(
             base_url=reader_url, model_name=reader_model, concurrency=concurrency,
             api_key=reader_key)
+        self._processor = processor
+        self._self_judge_wg = None
 
         # Answer-bearing RRG: build the gold/schema table for the relevant split.
         self.gold_table = {}
@@ -96,6 +98,16 @@ class RRGTrajectoryRewardManager:
             if not root:
                 raise ValueError("rrg reward_manager: data_kind=rrg needs train_task_root/val_task_root")
             self.gold_table = _build_gold_table(root)
+
+    def set_self_judge_wg(self, actor_rollout_wg):
+        """Post-init injection: replace the HTTP reward client with a SelfJudgeClient
+        that uses the policy's own vLLM engine for trajectory answer-recovery."""
+        self._self_judge_wg = actor_rollout_wg
+        from agent_system.environments.env_package.rrg.self_judge_client import SelfJudgeClient
+        self.reward_client = SelfJudgeClient(
+            tokenizer=self.tokenizer, processor=self._processor,
+            actor_rollout_wg=actor_rollout_wg,
+            config={"max_image_long": 768, "num_distractors": 4, "seed": 0})
 
     def _shape(self, recall: float, correct: bool) -> float:
         """Map raw answer-recovery recall (+correct) to the GiGPO macro reward (#3).

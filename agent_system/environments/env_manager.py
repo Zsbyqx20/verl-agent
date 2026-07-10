@@ -620,21 +620,28 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
     The trajectory/macro reward (completion judge) is computed post-rollout in the reward manager.
     """
 
-    def __init__(self, envs, projection_f, config):
+    def __init__(self, envs, projection_f, config, tokenizer=None, processor=None):
         self.is_multi_modal = True
         self.memory = SimpleMemory()
         self.history = None  # per-slot list of generated reasonings (SFT 'Step k:' format)
         self.cur_frames = None
 
         rcfg = config.env.rrg
+        self.rcfg = rcfg
+        self._tokenizer = tokenizer
+        self._processor = processor
+        self._self_judge_wg = None  # set later by set_self_judge_wg() if self_judge=True
         from agent_system.environments.env_package.rrg.reward_client import RRGRewardClient, action_str
         self._action_str = action_str
-        self.reward_client = RRGRewardClient(
-            base_url=rcfg.reader_url, model_name=rcfg.reader_model,
-            max_image_long=rcfg.get("max_image_long", 768),
-            num_distractors=rcfg.get("num_distractors", 4),
-            concurrency=rcfg.get("concurrency", 64),
-            subtract_control=rcfg.get("subtract_control", False))
+        if not rcfg.get("self_judge", False):
+            self.reward_client = RRGRewardClient(
+                base_url=rcfg.reader_url, model_name=rcfg.reader_model,
+                max_image_long=rcfg.get("max_image_long", 768),
+                num_distractors=rcfg.get("num_distractors", 4),
+                concurrency=rcfg.get("concurrency", 64),
+                subtract_control=rcfg.get("subtract_control", False))
+        else:
+            self.reward_client = None  # created lazily in set_self_judge_wg()
         self.coord_tol = rcfg.get("coord_tol", 8)
         # Val answer-checker: only the val replay env (is_train=False) computes terminal
         # answer-recovery correctness for success_rate; train relies on the reward manager's
@@ -687,6 +694,19 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                   + (f"; anneal off after {self.teacher_anneal_end_step} steps"
                      if self.teacher_anneal_end_step else ""))
         super().__init__(envs, projection_f, config)
+
+    def set_self_judge_wg(self, actor_rollout_wg):
+        """Post-init injection: replace the HTTP reward client with a SelfJudgeClient
+        that uses the policy's own vLLM engine (via actor_rollout_wg)."""
+        self._self_judge_wg = actor_rollout_wg
+        if self.rcfg.get("self_judge", False):
+            from agent_system.environments.env_package.rrg.self_judge_client import SelfJudgeClient
+            self.reward_client = SelfJudgeClient(
+                tokenizer=self._tokenizer, processor=self._processor,
+                actor_rollout_wg=actor_rollout_wg,
+                config=self.rcfg)
+            if self.answer_check and self.rcfg.get("val_reader_url", None) is None:
+                self.answer_client = self.reward_client
 
     # ----- helpers ----- #
     def _load_img(self, path):
@@ -816,7 +836,7 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
         return out
 
 
-def make_envs(config):
+def make_envs(config, tokenizer=None, processor=None):
     """
     Create enviroments 
     """ 
@@ -956,8 +976,10 @@ def make_envs(config):
         _val_envs = build_rrg_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size,
                                    group_n=1, is_train=False, env_kwargs=val_kwargs)
         projection_f = partial(rrg_projection)
-        envs = RRGEnvironmentManager(_envs, projection_f, config)
-        val_envs = RRGEnvironmentManager(_val_envs, projection_f, config)
+        envs = RRGEnvironmentManager(_envs, projection_f, config,
+                                     tokenizer=tokenizer, processor=processor)
+        val_envs = RRGEnvironmentManager(_val_envs, projection_f, config,
+                                         tokenizer=tokenizer, processor=processor)
         return envs, val_envs
     else:
         print("Environment not supported")
