@@ -134,6 +134,7 @@ class LLM(LLM):
             raise ValueError(f"Unexpected tokenizer type: {type(tokenizer)}. Must beone of the following: PreTrainedTokenizer, PreTrainedTokenizerFast, verl.workers.rollout.HybridEngineBaseTokenizer")
         self.llm_engine = LLMEngine.from_engine_args(model, tokenizer, engine_args)  # TODO: check usagecontext
         self.request_counter = Counter()
+        self._return_full_logprobs = False  # set True before generate() to get full per-token logprob dicts
 
     def init_cache_engine(self):
         self.llm_engine.init_cache_engine()
@@ -199,6 +200,7 @@ class LLM(LLM):
     def _post_process_outputs(self, request_outputs: List[RequestOutput]) -> Tuple[torch.Tensor, torch.Tensor]:
         output_token_ids = []
         logprobs = []
+        all_lp_dicts: list = []  # per-sample list of per-position dicts (only when _return_full_logprobs)
         for request_output in request_outputs:  # List[RequestOutput]
             outputs = request_output.outputs
             for output in outputs:  # List[CompletionOutput], usually len == 1
@@ -210,11 +212,20 @@ class LLM(LLM):
                     for logprobs_dict, id in zip(logprobs_dicts, output.token_ids):
                         logprob.append(logprobs_dict[id].logprob)
                     logprobs.append(torch.tensor(logprob))
+                    if self._return_full_logprobs:
+                        # Full per-position logprob distributions: List[Dict[int, float]]
+                        all_lp_dicts.append([
+                            {int(tid): float(lp.logprob) for tid, lp in pos.items()}
+                            for pos in logprobs_dicts
+                        ])
+        self._return_full_logprobs = False
 
         pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None else self.llm_engine.tokenizer.eos_token_id
         output_token_ids = pad_sequence(output_token_ids, batch_first=True, padding_value=pad_token_id)
         if len(logprobs) > 0:
             logprobs = pad_sequence(logprobs, batch_first=True, padding_value=pad_token_id)
+        if all_lp_dicts:
+            return output_token_ids, logprobs, all_lp_dicts
         return output_token_ids, logprobs
 
     def sync_model_weights(self, actor_weights: Iterable, load_format: str) -> None:
