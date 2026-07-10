@@ -69,10 +69,17 @@ from typing import List
 
 from msgspec import field
 from packaging import version as vs
-from vllm.lora.models import LoRAModel
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
+try:
+    # vllm 0.13.0 moved LoRAModel out of vllm.lora.models
+    from vllm.lora.worker_manager import LoRAModel  # noqa: F401
+except ImportError:  # vllm < 0.13.0
+    try:
+        from vllm.lora.models import LoRAModel  # noqa: F401
+    except ImportError:
+        LoRAModel = None  # LoRA-free paths (e.g. RRG smoke test) don't need it
 
 from verl.third_party.vllm import get_version
 
