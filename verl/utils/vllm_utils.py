@@ -208,17 +208,17 @@ class VLLMHijack():
                     hf_to_vllm_mapper = model.hf_to_vllm_mapper
 
                 if isinstance(lora_request, TensorLoRARequest):
+                    # vllm 0.13.0 compat: target_embedding_padding → model_vocab_size;
+                    # embedding_modules / embedding_padding_modules removed; PEFT helper
+                    # no longer carries lora_extra_vocab_size.
                     lora = self._lora_model_cls.from_lora_tensors(
                         lora_model_id=lora_request.lora_int_id,
                         tensors=lora_tensors,
                         peft_helper=peft_helper,
                         device="cpu",
                         dtype=self.lora_config.lora_dtype,
-                        embeddings=None,
-                        target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
-                        embedding_modules=self.embedding_modules,
-                        embedding_padding_modules=self.embedding_padding_modules,
-                        weights_mapper=hf_to_vllm_mapper
+                        model_vocab_size=self.vocab_size,
+                        weights_mapper=hf_to_vllm_mapper,
                     )
                 else:
                     lora = self._lora_model_cls.from_local_checkpoint(
@@ -228,18 +228,15 @@ class VLLMHijack():
                         lora_model_id=lora_request.lora_int_id,
                         device="cpu",
                         dtype=self.lora_config.lora_dtype,
-                        target_embedding_padding=self.vocab_size +
-                        self.lora_config.lora_extra_vocab_size,
-                        embedding_modules=self.embedding_modules,
-                        embedding_padding_modules=self.embedding_padding_modules,
-                        weights_mapper=hf_to_vllm_mapper)
+                        model_vocab_size=self.vocab_size,
+                        weights_mapper=hf_to_vllm_mapper,
+                    )
             except Exception as e:
                 raise e
 
-            if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
-                raise ValueError(f"LoRA added vocab size {lora.extra_vocab_size} "
-                                f"is greater than lora_extra_vocab_size "
-                                f"{self.lora_config.lora_extra_vocab_size}.")
+            # vllm 0.13.0 removed lora.extra_vocab_size from LoRAModel and
+            # lora_extra_vocab_size from LoRAConfig — the post-load vocab guard
+            # is no longer meaningful. Drop it.
             return lora
 
         def do_hijack(target_cls, target_method_name, hooking_method):
