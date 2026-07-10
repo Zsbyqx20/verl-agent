@@ -668,6 +668,34 @@ class ActorRolloutRefWorker(Worker):
         get_torch_device().empty_cache()
         return output
 
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def generate_with_logprobs(self, prompts: DataProto):
+        """Like generate_sequences but returns full per-token logprob distributions.
+        Used by SelfJudgeClient for step-margin MC forced-choice computation."""
+        prompts = prompts.to(get_torch_device().current_device())
+        assert self._is_rollout
+
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+        with self.rollout_sharding_manager:
+            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
+
+            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            output = self.rollout.generate_with_logprobs(prompts=prompts)
+
+            log_gpu_memory_usage("After rollout generation", logger=logger)
+
+            output = self.rollout_sharding_manager.postprocess_data(output)
+
+        output = output.to("cpu")
+
+        # clear kv cache
+        get_torch_device().empty_cache()
+        return output
+
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):

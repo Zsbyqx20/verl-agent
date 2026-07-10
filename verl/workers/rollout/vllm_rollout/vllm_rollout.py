@@ -31,6 +31,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from typing import List
 
+import numpy as np
 import torch
 import torch.distributed
 from omegaconf import DictConfig, OmegaConf
@@ -286,3 +287,91 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.free_cache_engine()
 
         return DataProto(batch=batch)
+
+    @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
+    @torch.no_grad()
+    def generate_with_logprobs(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Like generate_sequences but returns full per-token logprob distributions.
+
+        Sets _return_full_logprobs on the inference engine so that output[2] contains
+        per-sample, per-position dicts of token_id -> logprob. These are stored in
+        non_tensor_batch["full_logprobs"] of the returned DataProto for the self-judge
+        step-margin computation.
+
+        Sampling-param overrides come from prompts.meta_info keys matching SamplingParams
+        fields (e.g. 'max_tokens', 'logprobs', 'temperature'). Caller-specified **kwargs
+        also work but only when calling the rollout directly, not via worker group dispatch.
+        """
+        if self.config.free_cache_engine:
+            self.inference_engine.init_cache_engine()
+
+        idx = prompts.batch["input_ids"]
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+        eos_token_id = prompts.meta_info["eos_token_id"]
+        batch_size = idx.size(0)
+
+        idx_list = []
+        for i in range(batch_size):
+            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
+
+        # Merge sampling-param overrides from meta_info + call-time kwargs
+        # (meta_info is the reliable path through worker-group dispatch).
+        sampling_overrides = {}
+        for k in ("max_tokens", "logprobs", "temperature", "top_p", "top_k", "n",
+                  "best_of", "min_p", "ignore_eos"):
+            if k in prompts.meta_info:
+                sampling_overrides[k] = prompts.meta_info[k]
+        sampling_overrides.update(kwargs)
+
+        with self.update_sampling_params(**sampling_overrides):
+            self.inference_engine._return_full_logprobs = True
+            try:
+                output = self.inference_engine.generate(
+                    prompts=None,
+                    sampling_params=self.sampling_params,
+                    prompt_token_ids=idx_list,
+                    use_tqdm=False,
+                )
+            finally:
+                self.inference_engine._return_full_logprobs = False
+
+            response = output[0].to(idx.device)
+            log_probs = output[1].to(idx.device)
+            # Full per-token logprob distributions: List[List[Dict[int, float]]]
+            # Outer list: samples; inner list: token positions; dict: token_id -> logprob
+            full_logprobs = output[2] if len(output) > 2 else None
+
+            if response.shape[1] < self.config.response_length:
+                response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
+                log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
+
+            seq = torch.cat([idx, response], dim=-1)
+
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        response_position_ids = position_ids[:, -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        batch = TensorDict(
+            {
+                "prompts": idx,
+                "responses": response,
+                "input_ids": seq,
+                "rollout_log_probs": log_probs,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=batch_size,
+        )
+
+        if self.config.free_cache_engine:
+            self.inference_engine.free_cache_engine()
+
+        result = DataProto(batch=batch)
+        if full_logprobs is not None:
+            result.non_tensor_batch["full_logprobs"] = np.array(full_logprobs, dtype=object)
+        return result

@@ -310,6 +310,14 @@ class vLLMRollout(BaseRollout):
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
+        # Sampling-param overrides from meta_info (used by self-judge reward calls)
+        for k in ("max_tokens", "logprobs", "temperature", "top_p", "top_k", "n",
+                  "best_of", "min_p", "ignore_eos"):
+            if k in prompts.meta_info:
+                kwargs[k] = prompts.meta_info[k]
+
+        need_full_logprobs = kwargs.get("logprobs", 0) > 0
+
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -331,14 +339,23 @@ class vLLMRollout(BaseRollout):
 
             response = []
             rollout_log_probs = []
+            all_full_logprobs = []  # per-sample, per-position logprob dicts (only when need_full_logprobs)
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
                     curr_log_prob = []
+                    if need_full_logprobs:
+                        curr_full = []
                     for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                         curr_log_prob.append(logprob[response_ids[i]].logprob)
+                        if need_full_logprobs:
+                            curr_full.append({
+                                int(tid): float(lp.logprob) for tid, lp in logprob.items()
+                            })
                     rollout_log_probs.append(curr_log_prob)
+                    if need_full_logprobs:
+                        all_full_logprobs.append(curr_full)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
             rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
@@ -394,7 +411,118 @@ class vLLMRollout(BaseRollout):
         ):
             self.inference_engine.free_cache_engine()
 
+        if all_full_logprobs:
+            non_tensor_batch["full_logprobs"] = np.array(all_full_logprobs, dtype=object)
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
+    @torch.no_grad()
+    def generate_with_logprobs(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Like generate_sequences but returns full per-token logprob distributions.
+
+        Sampling-param overrides come from prompts.meta_info keys matching SamplingParams
+        fields (e.g. 'max_tokens', 'logprobs', 'temperature'). Caller-specified **kwargs
+        also work but only when calling the rollout directly, not via worker group dispatch.
+        Full logprob dicts are stored in non_tensor_batch['full_logprobs'].
+        """
+        idx = prompts.batch["input_ids"]
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+        eos_token_id = prompts.meta_info["eos_token_id"]
+        batch_size = idx.size(0)
+
+        non_tensor_batch = prompts.non_tensor_batch
+        if "raw_prompt_ids" not in non_tensor_batch:
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)],
+                dtype=object)
+
+        if "multi_modal_data" in non_tensor_batch:
+            vllm_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(
+                non_tensor_batch.pop("raw_prompt_ids"),
+                non_tensor_batch.pop("multi_modal_data")):
+                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids,
+                                    "multi_modal_data": multi_modal_data})
+        else:
+            vllm_inputs = [{"prompt_token_ids": raw_prompt_ids}
+                          for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")]
+
+        for input_data in vllm_inputs:
+            if isinstance(input_data["prompt_token_ids"], np.ndarray):
+                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
+            elif not isinstance(input_data["prompt_token_ids"], list):
+                raise TypeError(f"prompt_token_ids type error: {type(input_data['prompt_token_ids'])}")
+
+        # Merge sampling-param overrides from meta_info + call-time kwargs
+        sampling_overrides = {}
+        for k in ("max_tokens", "logprobs", "temperature", "top_p", "top_k", "n",
+                  "best_of", "min_p", "ignore_eos"):
+            if k in prompts.meta_info:
+                sampling_overrides[k] = prompts.meta_info[k]
+        sampling_overrides.update(kwargs)
+
+        with self.update_sampling_params(**sampling_overrides):
+            outputs = self.inference_engine.generate(
+                prompts=vllm_inputs,
+                sampling_params=self.sampling_params,
+                use_tqdm=False,
+            )
+
+            response = []
+            rollout_log_probs = []
+            all_full_logprobs = []  # per-sample: List[List[Dict[int, float]]]
+            for output in outputs:
+                for sample_id in range(len(output.outputs)):
+                    response_ids = output.outputs[sample_id].token_ids
+                    response.append(response_ids)
+                    curr_log_prob = []
+                    curr_full = []
+                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                        curr_log_prob.append(logprob[response_ids[i]].logprob)
+                        curr_full.append({
+                            int(tid): float(lp.logprob) for tid, lp in logprob.items()
+                        })
+                    rollout_log_probs.append(curr_log_prob)
+                    all_full_logprobs.append(curr_full)
+
+            response = pad_2d_list_to_length(response, self.pad_token_id,
+                                            max_length=self.config.response_length).to(idx.device)
+            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1,
+                                                      max_length=self.config.response_length).to(idx.device)
+            rollout_log_probs = rollout_log_probs.to(torch.float32)
+
+            seq = torch.cat([idx, response], dim=-1)
+
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+        if position_ids.dim() == 3:
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(
+                batch_size, position_ids.size(1), -1)
+
+        response_position_ids = position_ids[..., -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id,
+                                                    dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        batch = TensorDict(
+            {
+                "prompts": idx,
+                "responses": response,
+                "input_ids": seq,
+                "rollout_log_probs": rollout_log_probs,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=batch_size,
+        )
+
+        result = DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        if all_full_logprobs:
+            result.non_tensor_batch["full_logprobs"] = np.array(all_full_logprobs, dtype=object)
+        return result
 
 
 class vLLMAsyncRollout:
