@@ -23,13 +23,16 @@ import io
 import json
 import math
 import random
-from typing import Any, Dict, List, Optional
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from PIL import Image
 
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.utils import torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
 
@@ -38,6 +41,57 @@ from .reward_client import (
     action_str, hard_distractors, make_control, _render_trace,
 )
 from . import answer_recovery as A
+
+
+@dataclass
+class _MCPending:
+    """Handle returned by SelfJudgeClient.submit_score_step_margins. Joins the
+    background MC-scoring thread and decodes per-item margins on .get()."""
+    thread: Any                 # threading.Thread running the sync MC RPC
+    result_box: Dict[str, Any]  # {'gen_batch': DataProto, 'dt': float, 'error'?: Exception}
+    gold_letters: List[str]
+    option_letters: List[str]
+    decoder: Any                # tokenizer with .decode([tid]) for letter lookup
+
+    def get(self) -> List[float]:
+        """Block on the background thread and return per-item margins."""
+        self.thread.join()
+        if "error" in self.result_box:
+            raise self.result_box["error"]
+        gen_batch = self.result_box["gen_batch"]
+        if "dt" in self.result_box:
+            print(
+                f"[rrg-self-judge] step_margins (async) n={len(self.gold_letters)} "
+                f"dt={self.result_box['dt']:.3f}s",
+                flush=True,
+            )
+        return self._decode(gen_batch)
+
+    def _decode(self, gen_batch) -> List[float]:
+        full_lps = gen_batch.non_tensor_batch.get("full_logprobs")
+        if full_lps is None:
+            return [0.0] * len(self.gold_letters)
+        margins = []
+        for i, gold_letter in enumerate(self.gold_letters):
+            lp_dicts = full_lps[i]
+            if not lp_dicts:
+                margins.append(0.0)
+                continue
+            pos0 = lp_dicts[0]
+            gold_lp = self._logprob_for_letter(pos0, gold_letter)
+            lps = [self._logprob_for_letter(pos0, L) for L in self.option_letters]
+            m = max(lps)
+            denom = math.log(sum(math.exp(v - m) for v in lps)) + m
+            margins.append(float(max(0.0, min(1.0, math.exp(gold_lp - denom)))))
+        return margins
+
+    def _logprob_for_letter(self, logprob_dict, letter: str) -> float:
+        for tid, lp in logprob_dict.items():
+            tok = self.decoder.decode([tid]).strip()
+            if tok == letter:
+                return lp
+        max_lp = max(logprob_dict.values()) if logprob_dict else 0.0
+        return max_lp - 10.0
 
 
 # --------------------------------------------------------------------------- #
@@ -70,6 +124,24 @@ class SelfJudgeClient:
             self._get_rope_index = get_rope_index
         else:
             self._get_rope_index = None
+        # LRU cache for the image→(image_grid_thw, expanded template string) expansion.
+        # Keyed on the image bytes hash so identical screenshots reuse the processor output
+        # across calls (and across training iterations). Bounded to avoid unbounded growth
+        # on a long-running train loop. Survives across rollouts within this client.
+        self._vision_cache: Dict[Tuple[int, int], Tuple[Any, str]] = {}
+        self._vision_cache_max = 256
+
+    def _generate_sequences(self, batch: DataProto) -> DataProto:
+        """Run rollout generation with padding for non-divisible reward batches."""
+        batch_padded, pad_size = pad_dataproto_to_divisor(batch, self.wg.world_size)
+        gen_padded = self.wg.generate_sequences(batch_padded)
+        return unpad_dataproto(gen_padded, pad_size=pad_size)
+
+    def _generate_with_logprobs(self, batch: DataProto) -> DataProto:
+        """Run rollout generation with full logprobs for non-divisible reward batches."""
+        batch_padded, pad_size = pad_dataproto_to_divisor(batch, self.wg.world_size)
+        gen_padded = self.wg.generate_with_logprobs(batch_padded)
+        return unpad_dataproto(gen_padded, pad_size=pad_size)
 
     # ----- helpers ----- #
     @staticmethod
@@ -82,6 +154,33 @@ class SelfJudgeClient:
         buf = io.BytesIO()
         im.save(buf, format="PNG")
         return "data:image/png;base64," + __import__("base64").b64encode(buf.getvalue()).decode()
+
+    def _vision_expand_cached(self, img: Image.Image) -> Tuple[str, Any]:
+        """Return (vision_block_str, image_grid_thw) for an image. Caches on bytes hash so
+        repeated screenshots (e.g., same `task_id:step_idx` across training iterations, or
+        identical images within a batch) skip processor.image_processor and the placeholder
+        expansion loop. image_grid_thw is the per-image tensor returned by the processor; the
+        vision_block_str is `<|vision_start|><image_token>×N<|vision_end|>` ready to splice
+        into a chat-templated prompt in place of '<image>'.
+        """
+        key = (hash(img.tobytes()), img.size[0] * img.size[1])
+        cached = self._vision_cache.get(key)
+        if cached is not None:
+            return cached
+        row_mm_data = {'image': [np.array(img)]}
+        image_inputs = self.processor.image_processor(row_mm_data['image'], return_tensors='pt')
+        image_grid_thw = image_inputs['image_grid_thw']
+        merge_length = self.processor.image_processor.merge_size ** 2
+        n_placeholders = int(image_grid_thw[0].prod().item() // merge_length)
+        vision_block = (
+            '<|vision_start|>' + self.processor.image_token * n_placeholders + '<|vision_end|>')
+        result = (vision_block, image_grid_thw)
+        if len(self._vision_cache) >= self._vision_cache_max:
+            # Cheap LRU-ish eviction: drop the oldest insertion (FIFO). Dict preserves
+            # insertion order in CPython 3.7+.
+            self._vision_cache.pop(next(iter(self._vision_cache)))
+        self._vision_cache[key] = result
+        return result
 
     def _tokenize_batch(self, messages_list: List[List[Dict]], images_list: List = None) -> DataProto:
         """Tokenize a list of chat message lists into a DataProto for vLLM generation.
@@ -123,21 +222,10 @@ class SelfJudgeClient:
                 prompt_with_template = self.tokenizer.apply_chat_template(
                     chat, add_generation_prompt=True, tokenize=False)
 
-                # Process image and replace <image> with vision tokens
+                # Vision expansion (cached): see _vision_expand_cached docstring.
+                vision_block, image_grid_thw = self._vision_expand_cached(img)
+                prompt_with_template = prompt_with_template.replace('<image>', vision_block, 1)
                 row_mm_data = {'image': [np.array(img)]}
-                image_inputs = self.processor.image_processor(row_mm_data['image'], return_tensors='pt')
-                image_grid_thw = image_inputs['image_grid_thw']
-                merge_length = self.processor.image_processor.merge_size ** 2
-                idx = 0
-                while '<image>' in prompt_with_template:
-                    prompt_with_template = prompt_with_template.replace(
-                        '<image>',
-                        '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[idx].prod().item() // merge_length) +
-                        '<|vision_end|>',
-                        1,
-                    )
-                    idx += 1
-                prompt_with_template = prompt_with_template.replace('<|placeholder|>', self.processor.image_token)
                 multi_modal_data.append(row_mm_data)
             else:
                 # Text-only: apply chat template normally
@@ -222,20 +310,17 @@ class SelfJudgeClient:
         return max_lp - 10.0  # ~0.000045 probability
 
     # ----- public API (mirrors RRGRewardClient) ----- #
-    def score_step_margins(self, items: List[Dict[str, Any]], action_pool: List[str]) -> List[float]:
-        """items: [{goal, image, action(dict), reasoning}]; returns per-item margin in [-1,1].
-
-        Uses the policy's own vLLM engine (via generate_with_logprobs) to compute
-        renormalized P(correct|screenshot+reasoning) over K-way MC forced choice.
-        """
+    def _prepare_step_margin_batch(self, items, action_pool):
+        """Shared prompt-prep for sync and async step-margin calls. Returns
+        (batch, gold_letters, option_letters, items_for_redecode).
+        The batch is ready to feed _generate_with_logprobs / submit_score_step_margins."""
         rng = random.Random(self.seed)
         n_opts = self.num_distractors + 1
         option_letters = [chr(ord("A") + j) for j in range(n_opts)]
 
-        # Build MC prompts for all items (one batch call)
-        prompts_messages = []  # List[List[Dict]] — chat messages per item
-        images = []            # image paths per item (for multi-modal)
-        gold_letters = []      # expected letter per item
+        prompts_messages = []
+        images = []
+        gold_letters = []
 
         for idx, it in enumerate(items):
             a = it["action"]
@@ -263,63 +348,127 @@ class SelfJudgeClient:
             prompts_messages.append(messages)
             gold_letters.append(gold_letter)
 
-        # Tokenize and run inference (single batch call)
         batch = self._tokenize_batch(prompts_messages, images)
         for k, v in ("max_tokens", 1), ("logprobs", 20), ("temperature", 0), ("n", 1), ("do_sample", False):
             batch.meta_info[k] = v
-        gen_batch = self.wg.generate_sequences(batch)
+        return batch, gold_letters, option_letters, items, rng
 
+    def _decode_step_margins(self, gen_batch, gold_letters, option_letters):
+        """Decode per-item margins from a generate_with_logprobs result. Shared by sync
+        and async paths."""
         full_lps = gen_batch.non_tensor_batch.get("full_logprobs")
         if full_lps is None:
-            return [0.0] * len(items)
-
+            return [0.0] * len(gold_letters)
         margins = []
-        for i in range(len(items)):
-            lp_dicts = full_lps[i]  # List[Dict[int, float]] per position
+        for i, gold_letter in enumerate(gold_letters):
+            lp_dicts = full_lps[i]
             if not lp_dicts:
                 margins.append(0.0)
                 continue
-            pos0 = lp_dicts[0]  # first (and only) generated position
-            gold_lp = self._logprob_for_letter(pos0, gold_letters[i])
-
-            # Renormalize over option letters
+            pos0 = lp_dicts[0]
+            gold_lp = self._logprob_for_letter(pos0, gold_letter)
             lps = [self._logprob_for_letter(pos0, L) for L in option_letters]
             m = max(lps)
             denom = math.log(sum(math.exp(v - m) for v in lps)) + m
-            gen_p = math.exp(gold_lp - denom)
+            margins.append(float(max(0.0, min(1.0, math.exp(gold_lp - denom)))))
+        return margins
 
-            # Subtractive control (optional, off by default)
-            margin = gen_p
-            if self.subtract_control:
-                # Build a control prompt with content-free "reasoning"
-                it_img = items[i]["image"]
-                it_a = items[i]["action"]
-                it_options = hard_distractors(it_a, action_pool, rng, self.num_distractors)
-                it_options.append(action_str(it_a))
-                ctrl_text = self._build_mc_text(
-                    it["goal"], make_control(items[i].get("reasoning") or "", rng),
-                    it_options)
-                ctrl_content = []
-                if isinstance(it_img, str):
-                    ctrl_content.append({"type": "image", "image": self._data_url(it_img, self.max_image_long)})
-                ctrl_content.append({"type": "text", "text": ctrl_text})
-                ctrl_msgs = [{"role": "system", "content": STEP_SYSTEM},
-                           {"role": "user", "content": ctrl_content}]
-                ctrl_batch = self._tokenize_batch([ctrl_msgs], [it_img] if isinstance(it_img, str) else [None])
-                for k, v in ("max_tokens", 1), ("logprobs", 20), ("temperature", 0), ("n", 1), ("do_sample", False):
-                    ctrl_batch.meta_info[k] = v
-                ctrl_gen = self.wg.generate_sequences(ctrl_batch)
-                ctrl_lps = ctrl_gen.non_tensor_batch.get("full_logprobs")
-                if ctrl_lps is not None and ctrl_lps[0]:
-                    ctrl_pos0 = ctrl_lps[0][0]
-                    ctrl_vals = [self._logprob_for_letter(ctrl_pos0, L) for L in option_letters]
-                    ctrl_m = max(ctrl_vals)
-                    ctrl_denom = math.log(sum(math.exp(v - ctrl_m) for v in ctrl_vals)) + ctrl_m
-                    margin -= math.exp(self._logprob_for_letter(ctrl_pos0, gold_letters[i]) - ctrl_denom)
+    def score_step_margins(self, items: List[Dict[str, Any]], action_pool: List[str]) -> List[float]:
+        """items: [{goal, image, action(dict), reasoning}]; returns per-item margin in [-1,1].
 
-            margins.append(float(max(-1.0, min(1.0, margin))))
+        Sync path: uses the policy's own vLLM engine via generate_with_logprobs to compute
+        renormalized P(correct|screenshot+reasoning) over K-way MC forced choice. Blocks
+        until the GPU run completes. Honors self.subtract_control (off by default) by
+        also scoring a content-free reasoning and subtracting its probability."""
+        batch, gold_letters, option_letters, _, rng = self._prepare_step_margin_batch(items, action_pool)
+        t0 = time.perf_counter()
+        gen_batch = self._generate_with_logprobs(batch)
+        print(
+            f"[rrg-self-judge] step_margins n={len(items)} "
+            f"prompt_len={batch.batch['input_ids'].shape[-1]} dt={time.perf_counter() - t0:.3f}s",
+            flush=True,
+        )
+        margins = self._decode_step_margins(gen_batch, gold_letters, option_letters)
+
+        if self.subtract_control:
+            # Optional: subtract P(correct|control) where control is content-free reasoning.
+            # Off by default. Implements the same MC pattern with a fresh batch.
+            ctrl_margins = self._score_step_margins_control(items, action_pool, rng)
+            margins = [m - c for m, c in zip(margins, ctrl_margins)]
+            margins = [max(-1.0, min(1.0, m)) for m in margins]
 
         return margins
+
+    def _score_step_margins_control(self, items, action_pool, rng):
+        """P(correct | content-free reasoning) — used by subtract_control to remove the
+        baseline reward the model gives without seeing the actual reasoning text."""
+        n_opts = self.num_distractors + 1
+        option_letters = [chr(ord("A") + j) for j in range(n_opts)]
+        prompts_messages = []
+        images = []
+        gold_letters = []
+        for it in items:
+            a = it["action"]
+            it_options = hard_distractors(a, action_pool, rng, self.num_distractors)
+            it_options.append(action_str(a))
+            ctrl_text = self._build_mc_text(
+                it["goal"], make_control(it.get("reasoning") or "", rng),
+                it_options)
+            ctrl_content = []
+            img_path = it["image"]
+            if isinstance(img_path, str):
+                ctrl_content.append({"type": "image", "image": self._data_url(img_path, self.max_image_long)})
+                images.append(img_path)
+            else:
+                images.append(None)
+            ctrl_content.append({"type": "text", "text": ctrl_text})
+            prompts_messages.append([
+                {"role": "system", "content": STEP_SYSTEM},
+                {"role": "user", "content": ctrl_content},
+            ])
+            gold_idx = it_options.index(action_str(a))
+            gold_letters.append(chr(ord("A") + gold_idx))
+        batch = self._tokenize_batch(prompts_messages, images)
+        for k, v in ("max_tokens", 1), ("logprobs", 20), ("temperature", 0), ("n", 1), ("do_sample", False):
+            batch.meta_info[k] = v
+        gen_batch = self._generate_with_logprobs(batch)
+        return self._decode_step_margins(gen_batch, gold_letters, option_letters)
+
+    def submit_score_step_margins(self, items, action_pool) -> "_MCPending":
+        """Async path: fire the MC scoring RPC in a background thread, return immediately
+        with an _MCPending. The thread calls the sync wg.generate_with_logprobs(batch)
+        (which goes through the @register dispatch + ray.get on the Ray actor task).
+        Because the Ray actor task queue serializes anyway, we don't save GPU work —
+        we save DRIVER-SIDE blocking time: the rollout loop can run the next iteration's
+        actor_rollout_wg.generate_sequences in parallel with the MC scoring thread.
+        This is the simplest async that works with the existing @register dispatch."""
+        import threading
+        batch, gold_letters, option_letters, _, _ = self._prepare_step_margin_batch(items, action_pool)
+        batch_padded, pad_size = pad_dataproto_to_divisor(batch, self.wg.world_size)
+        result_box: Dict[str, Any] = {}
+
+        def _run():
+            try:
+                t0 = time.perf_counter()
+                gen_batch = self.wg.generate_with_logprobs(batch_padded)
+                # The sync path's _generate_with_logprobs wrapper added pad/unpad and
+                # the registered dispatch; for the threaded path we do it inline.
+                if pad_size:
+                    gen_batch = unpad_dataproto(gen_batch, pad_size=pad_size)
+                result_box["gen_batch"] = gen_batch
+                result_box["dt"] = time.perf_counter() - t0
+            except Exception as e:
+                result_box["error"] = e
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        return _MCPending(
+            thread=thread,
+            result_box=result_box,
+            gold_letters=gold_letters,
+            option_letters=option_letters,
+            decoder=self.tokenizer,
+        )
 
     @staticmethod
     def _build_mc_text(goal: str, reasoning: Optional[str], options: List[str]) -> str:
@@ -356,7 +505,7 @@ class SelfJudgeClient:
         batch = self._tokenize_batch(prompts_messages, images_list=[None] * len(items))
         for k, v in ("max_tokens", max_tokens), ("temperature", 0), ("n", 1), ("do_sample", False):
             batch.meta_info[k] = v
-        gen_batch = self.wg.generate_sequences(batch)
+        gen_batch = self._generate_sequences(batch)
 
         responses = gen_batch.batch["responses"]  # (bs, max_resp_len)
         out = []
@@ -409,7 +558,7 @@ class SelfJudgeClient:
         batch = self._tokenize_batch(prompts_messages, images_list=[None] * len(plans))
         for k, v in ("max_tokens", max_tokens), ("temperature", 0), ("n", 1), ("do_sample", False):
             batch.meta_info[k] = v
-        gen_batch = self.wg.generate_sequences(batch)
+        gen_batch = self._generate_sequences(batch)
 
         responses = gen_batch.batch["responses"]
         # Parse results per prefix query

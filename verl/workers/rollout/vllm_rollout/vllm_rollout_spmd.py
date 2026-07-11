@@ -486,10 +486,18 @@ class vLLMRollout(BaseRollout):
                     rollout_log_probs.append(curr_log_prob)
                     all_full_logprobs.append(curr_full)
 
+            # Pad to the smaller of (config.response_length, actual gen_len+1). For self-judge
+            # calls (max_tokens=1) this avoids materializing a (N, response_length) tensor of
+            # mostly-pad tokens that gets round-tripped via Ray back to the driver; the consumer
+            # (SelfJudgeClient) only inspects non_tensor_batch['full_logprobs'] and ignores
+            # `responses` shape. Policy rollouts (max_tokens=response_length) are unaffected
+            # because gen_len ≈ response_length for them.
+            gen_len = max((len(r) for r in response), default=1)
+            target_resp_len = min(self.config.response_length, max(gen_len, 1))
             response = pad_2d_list_to_length(response, self.pad_token_id,
-                                            max_length=self.config.response_length).to(idx.device)
+                                            max_length=target_resp_len).to(idx.device)
             rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1,
-                                                      max_length=self.config.response_length).to(idx.device)
+                                                      max_length=target_resp_len).to(idx.device)
             rollout_log_probs = rollout_log_probs.to(torch.float32)
 
             seq = torch.cat([idx, response], dim=-1)

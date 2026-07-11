@@ -688,6 +688,17 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
         self.group_n = int(getattr(config.env.rollout, "n", 0)) or int(getattr(envs, "group_n", 1))
         self.is_train_env = bool(getattr(envs, "is_train", True))
         self._reset_count = 0
+        # Async MC pipeline: when self_judge is on and reward_client supports async submit,
+        # step() submits the MC RPC and returns zeros; the rollout loop calls
+        # flush_pending_mc() at the start of the next iteration to get the prior step's
+        # margins and add them to episode_rewards. The first iteration bootstraps synchronously
+        # so episode_rewards[0] = MC(reasonings[0]) is accurate.
+        self._pending_mc = None
+        self._step_count = 0
+        # Async MC is enabled lazily: at __init__ time the reward_client is None for the
+        # self-judge path (it gets injected later via set_self_judge_wg). Decide here
+        # whether to *attempt* async and re-check at every step() call (cheap hasattr).
+        self._async_mc_eligible = bool(rcfg.get("self_judge", False))
         if self.teacher_store and self.teacher_seed_k > 0 and self.is_train_env:
             print(f"[rrg-teacher] loaded {len(self.teacher_store)} teacher trajectories; seeding "
                   f"{self.teacher_seed_k}/{self.group_n} slots per group"
@@ -768,16 +779,39 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
             print(f"[rrg-teacher] reset {self._reset_count}: {n_teacher} teacher-forced slots", flush=True)
         return obs, infos
 
+    def flush_pending_mc(self):
+        """Await the previously-submitted async MC scoring RPC and return its per-item
+        margins, or None if nothing was pending. Called by the rollout loop at the
+        start of each iteration so episode_rewards keeps correct per-step accounting
+        while the MC RPC overlaps the policy rollout. Resets the pending slot."""
+        if self._pending_mc is None:
+            return None
+        pending, self._pending_mc = self._pending_mc, None
+        try:
+            return pending.get()
+        except Exception as e:
+            print(f"[rrg-self-judge] pending MC .get() failed: {type(e).__name__}: {e}", flush=True)
+            return [0.0] * len(self.cur_frames) if self.cur_frames else [0.0]
+
     def step(self, text_actions: List[str]):
         text_actions = list(text_actions)
         actions, valids = self.projection_f(text_actions)
         frames = self.cur_frames
 
-        # (1) per-step action-recovery margin (reader SEES the current screenshot)
+        # (1) per-step action-recovery margin (reader SEES the current screenshot).
+        # Async path: submit the MC RPC and return placeholder zeros so the rollout loop
+        # can keep running. The next iteration's flush_pending_mc() retrieves the
+        # actual margins. Bootstrap iteration (step_count==0) runs synchronously to
+        # seed episode_rewards[0] correctly.
         items = [{"goal": fr["goal"], "image": fr["image_path"], "action": fr["action"],
                   "reasoning": text_actions[i]} for i, fr in enumerate(frames)]
-        rewards = np.asarray(self.reward_client.score_step_margins(items, self.action_pool),
-                             dtype=np.float32)
+        if self._async_mc_eligible and self._step_count > 0 and hasattr(self.reward_client, "submit_score_step_margins"):
+            self._pending_mc = self.reward_client.submit_score_step_margins(items, self.action_pool)
+            rewards = np.zeros(len(items), dtype=np.float32)
+        else:
+            rewards = np.asarray(self.reward_client.score_step_margins(items, self.action_pool),
+                                 dtype=np.float32)
+        self._step_count += 1
 
         # (2) leakage veto folded into validity
         for i, fr in enumerate(frames):

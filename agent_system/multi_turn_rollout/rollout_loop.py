@@ -369,7 +369,29 @@ class TrajectoryCollector:
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
         # Trajectory collection loop
+        # prev_active_masks holds the active set of the previous iteration; we use it to
+        # add the deferred MC reward only to envs that were active when it was earned.
+        prev_active_masks = None
         for _step in range(self.config.env.max_steps):
+            # Deferred-await MC pipeline: when the previous step's env.step() submitted an
+            # async MC RPC, await it now (overlapping with this iteration's policy rollout)
+            # and add the resulting margins to episode_rewards BEFORE recording this step.
+            # On the first iteration there's no pending MC; step() inside the loop will
+            # bootstrap synchronously so episode_rewards[0] is correct.
+            prev_mc = envs.flush_pending_mc() if hasattr(envs, "flush_pending_mc") else None
+            if prev_mc is not None and prev_active_masks is not None:
+                prev_arr = np.asarray(prev_mc, dtype=np.float32)
+                if prev_arr.shape == episode_rewards.shape:
+                    episode_rewards[prev_active_masks] += prev_arr[prev_active_masks]
+                # Also patch the per-step reward stored in total_batch_list[env][-1]
+                # (which was a placeholder zero when submitted async) with the actual
+                # MC margin. Otherwise GiGPO's compute_step_discounted_returns sees zeros
+                # for those steps.
+                for i in np.nonzero(prev_active_masks)[0]:
+                    if total_batch_list[i]:
+                        total_batch_list[i][-1]['rewards'] = (
+                            total_batch_list[i][-1]['rewards'] + prev_arr[i])
+
             active_masks = np.logical_not(is_done)
 
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
@@ -465,14 +487,33 @@ class TrajectoryCollector:
 
             # Update done states
             is_done = np.logical_or(is_done, dones)
-                
+
+            # Carry forward the active set so the deferred MC reward from THIS iteration
+            # can be attributed only to envs that were active when it was earned.
+            prev_active_masks = active_masks
+
             # Update observations for next step
             obs = next_obs
 
             # Break if all environments are done
             if is_done.all():
                 break
-        
+
+        # Final flush: the last iteration may have submitted an async MC RPC that hasn't
+        # been awaited yet. Drain it now so the deferred margin gets attributed to the
+        # last iteration's envs. Use the last-known prev_active_masks (which was the
+        # active set during the iteration that submitted the pending MC).
+        final_mc = envs.flush_pending_mc() if hasattr(envs, "flush_pending_mc") else None
+        if final_mc is not None and prev_active_masks is not None:
+            final_arr = np.asarray(final_mc, dtype=np.float32)
+            if final_arr.shape == episode_rewards.shape:
+                episode_rewards[prev_active_masks] += final_arr[prev_active_masks]
+            # Patch the per-step reward in total_batch_list too (see comment above).
+            for i in np.nonzero(prev_active_masks)[0]:
+                if total_batch_list[i]:
+                    total_batch_list[i][-1]['rewards'] = (
+                        total_batch_list[i][-1]['rewards'] + final_arr[i])
+
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,
                     total_batch_list=total_batch_list,
