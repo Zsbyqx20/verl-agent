@@ -222,6 +222,14 @@ class vLLMRollout(BaseRollout):
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
 
+        # Sampling-param overrides from meta_info (used by self-judge reward calls).
+        # Worker-group dispatch cannot pass call-time kwargs, so meta_info is the
+        # reliable path for per-call max_tokens/logprobs/temperature overrides.
+        for k in ("max_tokens", "logprobs", "temperature", "top_p", "top_k", "n",
+                  "best_of", "min_p", "ignore_eos"):
+            if k in prompts.meta_info:
+                kwargs[k] = prompts.meta_info[k]
+
         lora_requests = None
         if self.lora_kwargs:
             # self.inference_engine.llm_engine.list_loras

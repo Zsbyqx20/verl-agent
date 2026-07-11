@@ -27,6 +27,9 @@ def process_image(image: Union[dict, Image.Image]) -> Image.Image:
     if "bytes" in image:
         assert "image" not in image, "Cannot have both `bytes` and `image`"
         image["image"] = BytesIO(image["bytes"])
+        # fetch_image expects `image["image"]` to be a string (path/URL/base64),
+        # not a BytesIO. BytesIO has no .startswith, so handle it here directly.
+        return Image.open(image["image"]).convert("RGB")
 
     return fetch_image(image)
 
