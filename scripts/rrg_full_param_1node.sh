@@ -140,6 +140,7 @@ N_GPUS="${N_GPUS:-8}"
     env.rrg.concurrency=16 \
     env.rrg.self_judge=True \
     env.rrg.answer_max_tokens=512 \
+    env.rrg.policy_image_max_pixels=786432 \
     env.rrg.answer_step_credit=true \
     env.rrg.step_credit_w=1.0 \
     env.rrg.step_credit_mode=delta \

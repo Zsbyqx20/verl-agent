@@ -107,7 +107,16 @@ class TrajectoryCollector:
         if is_multi_modal:
             # Replace image placeholder with vision tokens
             raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
-            row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
+            # Cap per-image pixel count to bound ViT forward cost. The Qwen3-VL
+            # processor's image_processor also has its own max_pixels ceiling,
+            # but applying ours first avoids producing an oversized PIL.Image that
+            # the processor has to downsample internally.
+            rcfg = self.config.env.get("rrg", {}) if hasattr(self.config, "env") else {}
+            policy_max_pixels = rcfg.get("policy_image_max_pixels", None)
+            if policy_max_pixels is not None:
+                row_dict['multi_modal_data'] = {'image': [process_image(obs_image, max_pixels=int(policy_max_pixels))]}
+            else:
+                row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
             image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
             image_grid_thw = image_inputs['image_grid_thw']
             row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}

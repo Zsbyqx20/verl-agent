@@ -350,6 +350,12 @@ env:
     val_num_episodes: null
     num_distractors: 4         # K-1 hard distractors for the step action-recovery margin
     max_image_long: 768        # reader-side screenshot downscale
+    policy_image_max_pixels: null  # cap per-image pixel count BEFORE the Qwen3-VL
+                                  # processor runs. null = no cap (defaults to
+                                  # process_image's 2048*2048=4M ceiling).
+                                  # 1024*768=786432 is a good production setting
+                                  # that bounds ViT cost (~half the patches vs
+                                  # unconstrained).
     coord_tol: 8               # px tolerance for the coordinate-leakage veto
     concurrency: 64            # async reward calls in flight
     subtract_control: false    # subtract a content-free control from the step margin
