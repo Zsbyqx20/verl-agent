@@ -1215,6 +1215,11 @@ class RayPPOTrainer:
                     # recompute old_log_probs
                     with _timer("old_log_prob", timing_raw):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        # Surface per-block timings (H2D, ulysses, actor_compute, mb/*) emitted by
+                        # the worker into timing_raw so they show up as timing_s/<block> in metrics.
+                        lp_timings = old_log_prob.meta_info.get("compute_log_prob_timings") or {}
+                        for k, v in lp_timings.items():
+                            timing_raw[f"logp_{k}"] = timing_raw.get(f"logp_{k}", 0.0) + float(v)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1329,6 +1334,12 @@ class RayPPOTrainer:
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        # Surface per-block timings (H2D/H2C + per-block _forward_block/*) emitted by
+                        # the worker into timing_raw so they show up as timing_s/<block> in metrics.
+                        for k, v in actor_output_metrics.items():
+                            if k.startswith("_update_outer/") or k.startswith("_forward_block/"):
+                                tk = f"update_{k.split('/', 1)[1]}"
+                                timing_raw[tk] = timing_raw.get(tk, 0.0) + float(v)
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
