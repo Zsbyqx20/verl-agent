@@ -201,6 +201,16 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            # vLLM 0.17.0 has a bug in MultiModalReceiverCache where the
+            # engine-side LRU evicts items faster than the worker-side cache
+            # can serve them, and `get_and_update_item` asserts when both
+            # the cache misses and the input mm_item is None (which happens
+            # for cross-step rollouts in PPO where the same image is re-sent
+            # but the cache evicted it). Workaround: disable the engine-side
+            # receiver cache (verl doesn't need it — verl always re-sends
+            # multi_modal_data on every rollout). Re-enable when vLLM fixes
+            # the assertion in cache.py:644.
+            mm_processor_cache_gb=0,
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
