@@ -25,6 +25,7 @@ init from the task_root. The goal is parsed from the decoded prompt (build_text_
 """
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from collections import defaultdict
@@ -34,6 +35,22 @@ import numpy as np
 import torch
 
 _GOAL_RE = re.compile(r"# Task goal\s*\n(.*?)\n\s*\n", re.DOTALL)
+
+
+def _per_step_repeat(texts: list, lookback: int) -> list:
+    """repeat_t = max difflib-ratio of texts[t] against any of the `lookback` strictly earlier
+    texts in the SAME sequence (catches A->B->A cycles, not just adjacent duplicates); 0.0 at
+    t=0. MUST stay identical to `per_step_repeat` in src/repetition_penalty_probe.py -- that is
+    the offline-validated computation this reward term reuses."""
+    out = [0.0]
+    for t in range(1, len(texts)):
+        best = 0.0
+        for s in range(max(0, t - lookback), t):
+            r = difflib.SequenceMatcher(None, texts[s], texts[t]).ratio()
+            if r > best:
+                best = r
+        out.append(best)
+    return out
 
 
 def _build_gold_table(task_root: str) -> dict:
@@ -67,7 +84,9 @@ class RRGTrajectoryRewardManager:
                  threshold_bonus: float = 0.5, answer_step_credit: bool = False,
                  step_credit_w: float = 1.0, step_credit_mode: str = "first_appearance",
                  step_credit_combine: str = "add", max_prefixes: int = 8,
-                 clamp_negative: bool = True, processor=None, **kwargs) -> None:
+                 clamp_negative: bool = True, repetition_penalty: bool = False,
+                 repetition_penalty_w: float = 1.0, repetition_lookback: int = 15,
+                 repetition_threshold: float = 0.97, processor=None, **kwargs) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.data_kind = data_kind
@@ -84,6 +103,11 @@ class RRGTrajectoryRewardManager:
         self.step_credit_combine = step_credit_combine  # add | replace
         self.max_prefixes = int(max_prefixes)
         self.clamp_negative = bool(clamp_negative)
+        # repetition penalty (GiGPO MICRO channel); off by default = byte-identical
+        self.repetition_penalty = bool(repetition_penalty)
+        self.repetition_penalty_w = float(repetition_penalty_w)
+        self.repetition_lookback = int(repetition_lookback)
+        self.repetition_threshold = float(repetition_threshold)
         from agent_system.environments.env_package.rrg.reward_client import RRGRewardClient
         self.reward_client = RRGRewardClient(
             base_url=reader_url, model_name=reader_model, concurrency=concurrency,
@@ -150,6 +174,20 @@ class RRGTrajectoryRewardManager:
             ft = next((t for t in range(n) if pth in mpaths[t]), n - 1)
             c[ft] += per
         return c
+
+    def _repetition_penalties(self, texts: list) -> tuple:
+        """Per-step (penalty_t, repeat_t) for one trajectory's reasoning-text sequence.
+        penalty_t = -w * clip((repeat_t - threshold) / (1 - threshold), 0, 1): a ramp, always
+        <=0, ZERO below threshold. Uses the same bounded-lookback difflib computation validated
+        in src/repetition_penalty_probe.py -- see _per_step_repeat above."""
+        raws = _per_step_repeat(texts, self.repetition_lookback)
+        span = 1.0 - self.repetition_threshold
+        pens = []
+        for r in raws:
+            frac = (r - self.repetition_threshold) / span if span > 0 else (1.0 if r >= self.repetition_threshold else 0.0)
+            frac = min(max(frac, 0.0), 1.0)
+            pens.append(-self.repetition_penalty_w * frac)
+        return pens, raws
 
     def __call__(self, data, return_dict=False):
         if "rm_scores" in data.batch.keys():
@@ -242,10 +280,15 @@ class RRGTrajectoryRewardManager:
         # this manager runs -- see the reordered block in ray_trainer). Diagnostic columns are
         # broadcast per-trajectory to its step-rows like the recall columns.
         do_credit = self.answer_step_credit and ("rewards" in data.non_tensor_batch)
-        step_rewards_arr = data.non_tensor_batch["rewards"] if do_credit else None
+        # Repetition penalty needs no reader call / gold lookup (pure text vs the trajectory's
+        # own earlier steps) so it applies to every trajectory, not just answer-bearing ones.
+        do_rep = self.repetition_penalty and ("rewards" in data.non_tensor_batch)
+        step_rewards_arr = data.non_tensor_batch["rewards"] if (do_credit or do_rep) else None
         row_step_credit = np.zeros(len(data), dtype=np.float32)
         row_reader_calls = np.zeros(len(data), dtype=np.float32)
         row_temporal = np.zeros(len(data), dtype=np.float32)
+        row_repeat_penalty = np.zeros(len(data), dtype=np.float32)
+        row_repeat_high = np.zeros(len(data), dtype=np.float32)
         for idxs_sorted, res, it, pr in zip(group_order, results, items, prefix_results):
             recall = float(res["recall"])
             # row_recall logs RAW recall (the research metric); the reward written to the
@@ -262,6 +305,9 @@ class RRGTrajectoryRewardManager:
             except Exception:
                 pred_str = str(pred)
             credits = self._step_credits(pr) if (do_credit and pr is not None) else None
+            rep_pens = rep_raws = None
+            if do_rep:
+                rep_pens, rep_raws = self._repetition_penalties([rows[i]["resp"] for i in idxs_sorted])
             any_late = False
             for t, i in enumerate(idxs_sorted):
                 row_recall[i] = recall
@@ -278,6 +324,13 @@ class RRGTrajectoryRewardManager:
                     step_rewards_arr[i] = float(base + self.step_credit_w * ct)
                     if ct > 0 and t > 0:
                         any_late = True
+                if rep_pens is not None:
+                    # Always ADDITIVE on top of whatever the credit block above left in place --
+                    # this is a malus/veto (like the existing restatement/leakage penalty), not a
+                    # shaping choice governed by step_credit_combine (that knob is credit-only).
+                    row_repeat_penalty[i] = rep_pens[t]
+                    row_repeat_high[i] = 1.0 if rep_raws[t] >= self.repetition_threshold else 0.0
+                    step_rewards_arr[i] = float(step_rewards_arr[i]) + rep_pens[t]
             if credits is not None:
                 ncalls = float(pr.get("n_reader_calls", 0)) if pr else 0.0
                 for i in idxs_sorted:
@@ -302,5 +355,8 @@ class RRGTrajectoryRewardManager:
                 extra["answer_step_credit"] = row_step_credit
                 extra["answer_reader_calls"] = row_reader_calls
                 extra["answer_temporal"] = row_temporal
+            if self.repetition_penalty:
+                extra["repetition_penalty"] = row_repeat_penalty
+                extra["repeat_high"] = row_repeat_high
             return {"reward_tensor": reward_tensor, "reward_extra_info": extra}
         return reward_tensor

@@ -387,3 +387,10 @@ env:
     step_credit_combine: add            # add (to action margin) | replace
     max_prefixes: 8                     # cap reader prefix-assembles per trajectory (subsample beyond)
     clamp_negative: true                # clamp per-step credit to >=0 (delta-mode flicker guard)
+    # --- repetition penalty (GiGPO MICRO channel) ---
+    # Penalize a step whose reasoning is near-duplicate of an earlier step in the SAME rollout
+    # (bounded lookback). Off by default => byte-identical to the plain run.
+    repetition_penalty: false
+    repetition_penalty_w: 1.0
+    repetition_lookback: 15
+    repetition_threshold: 0.97

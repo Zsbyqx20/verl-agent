@@ -276,6 +276,11 @@ def _compute_rrg_reward_metrics(batch: DataProto) -> dict:
         vals = [float(temporal[uids == u].mean()) for u in set(uids.tolist())]
         if vals:
             metrics["rrg/temporal_credit_fraction"] = float(np.mean(vals))
+    # Repetition-penalty diagnostics (only present when env.rrg.repetition_penalty is on).
+    if "repetition_penalty" in ntb:
+        metrics["rrg/repetition_penalty/mean"] = float(np.asarray(ntb["repetition_penalty"], dtype=np.float32).mean())
+    if "repeat_high" in ntb:
+        metrics["rrg/repeat_frac_high"] = float(np.asarray(ntb["repeat_high"], dtype=np.float32).mean())
     return metrics
 
 def compute_response_mask(data: DataProto):

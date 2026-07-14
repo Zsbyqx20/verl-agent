@@ -177,6 +177,10 @@ class TaskRunner:
                 step_credit_combine=rcfg.get('step_credit_combine', 'add'),
                 max_prefixes=rcfg.get('max_prefixes', 8),
                 clamp_negative=rcfg.get('clamp_negative', True),
+                repetition_penalty=rcfg.get('repetition_penalty', False),
+                repetition_penalty_w=rcfg.get('repetition_penalty_w', 1.0),
+                repetition_lookback=rcfg.get('repetition_lookback', 15),
+                repetition_threshold=rcfg.get('repetition_threshold', 0.97),
                 processor=processor, **common)
             # Val/eval reward: optional stronger reader (doubao) for an accurate test_score,
             # and shaping FORCED OFF so val/rrg/test_score stays raw recall (a comparable metric).
