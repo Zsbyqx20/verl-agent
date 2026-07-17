@@ -639,7 +639,8 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                 max_image_long=rcfg.get("max_image_long", 768),
                 num_distractors=rcfg.get("num_distractors", 4),
                 concurrency=rcfg.get("concurrency", 64),
-                subtract_control=rcfg.get("subtract_control", False))
+                subtract_control=rcfg.get("subtract_control", False),
+                answer_prompt_path=rcfg.get("answer_prompt_path", None))
         else:
             self.reward_client = None  # created lazily in set_self_judge_wg()
         self.coord_tol = rcfg.get("coord_tol", 8)
@@ -660,7 +661,8 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                 concurrency=rcfg.get("concurrency", 64),
                 # key from env (RRG_VAL_READER_KEY) so it stays out of the logged/uploaded config.
                 api_key=(os.environ.get("RRG_VAL_READER_KEY")
-                         or rcfg.get("val_reader_key", None) or "sk-dummy"))
+                         or rcfg.get("val_reader_key", None) or "sk-dummy"),
+                answer_prompt_path=rcfg.get("answer_prompt_path", None))
             self.answer_max_tokens = rcfg.get("val_answer_max_tokens", None) or self.answer_max_tokens
 
         self.system_prompt = ""

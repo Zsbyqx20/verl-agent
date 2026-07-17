@@ -86,11 +86,16 @@ class RRGTrajectoryRewardManager:
                  step_credit_combine: str = "add", max_prefixes: int = 8,
                  clamp_negative: bool = True, repetition_penalty: bool = False,
                  repetition_penalty_w: float = 1.0, repetition_lookback: int = 15,
-                 repetition_threshold: float = 0.97, processor=None, **kwargs) -> None:
+                 repetition_threshold: float = 0.97, processor=None,
+                 answer_prompt_path: str | None = None, **kwargs) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.data_kind = data_kind
         self.answer_max_tokens = answer_max_tokens
+        # Answer-assembly system prompt override (e.g. AndroidControl's blind
+        # action-sequence-recovery framing instead of RRG's default). None -> the reward
+        # client falls back to its own hardcoded default, byte-identical to prior behavior.
+        self.answer_prompt_path = answer_prompt_path
         self.traj_reward_shaping = traj_reward_shaping
         self.shaping_power = shaping_power
         self.correct_bonus_lambda = correct_bonus_lambda
@@ -111,7 +116,7 @@ class RRGTrajectoryRewardManager:
         from agent_system.environments.env_package.rrg.reward_client import RRGRewardClient
         self.reward_client = RRGRewardClient(
             base_url=reader_url, model_name=reader_model, concurrency=concurrency,
-            api_key=reader_key)
+            api_key=reader_key, answer_prompt_path=answer_prompt_path)
         self._processor = processor
         self._self_judge_wg = None
 
@@ -131,7 +136,8 @@ class RRGTrajectoryRewardManager:
         self.reward_client = SelfJudgeClient(
             tokenizer=self.tokenizer, processor=self._processor,
             actor_rollout_wg=actor_rollout_wg,
-            config={"max_image_long": 768, "num_distractors": 4, "seed": 0})
+            config={"max_image_long": 768, "num_distractors": 4, "seed": 0,
+                    "answer_prompt_path": self.answer_prompt_path})
 
     def _shape(self, recall: float, correct: bool) -> float:
         """Map raw answer-recovery recall (+correct) to the GiGPO macro reward (#3).

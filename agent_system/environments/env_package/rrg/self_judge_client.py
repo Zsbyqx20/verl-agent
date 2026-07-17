@@ -114,6 +114,14 @@ class SelfJudgeClient:
         self.seed = config.get("seed", 0)
         self.max_prompt_length = config.get("max_prompt_length", 32768)
         self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        # Answer-assembly system prompt override (see RRGRewardClient) -- same knob, same
+        # default fallback, so self-judge and the HTTP reader stay in sync.
+        answer_prompt_path = config.get("answer_prompt_path")
+        if answer_prompt_path:
+            from pathlib import Path
+            self.answer_prompt = Path(answer_prompt_path).read_text(encoding="utf-8")
+        else:
+            self.answer_prompt = A.ANSWER_PROMPT
         # Detect processor class for position_id computation
         pc_name = processor.__class__.__name__ if processor is not None else ""
         if "Qwen3VL" in pc_name:
@@ -498,7 +506,7 @@ class SelfJudgeClient:
                 f"# Required output JSON Schema\n{json.dumps(it['schema'], ensure_ascii=False, indent=2)}"
             )
             prompts_messages.append([
-                {"role": "system", "content": A.ANSWER_PROMPT},
+                {"role": "system", "content": self.answer_prompt},
                 {"role": "user", "content": user_text},
             ])
 
@@ -551,7 +559,7 @@ class SelfJudgeClient:
                 f"# Required output JSON Schema\n{json.dumps(it['schema'], ensure_ascii=False, indent=2)}"
             )
             prompts_messages.append([
-                {"role": "system", "content": A.ANSWER_PROMPT},
+                {"role": "system", "content": self.answer_prompt},
                 {"role": "user", "content": user_text},
             ])
 

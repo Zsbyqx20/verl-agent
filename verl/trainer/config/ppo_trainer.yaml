@@ -343,6 +343,11 @@ env:
     # --- rrg (answer-recovery) source: directory trees with tasks.json + rrg-source.csv + params_cache.json ---
     train_task_root: "${oc.env:HOME}/ReverseReasoningGenerator/data/rrg-train"
     val_task_root: "${oc.env:HOME}/ReverseReasoningGenerator/data/rrg-val"
+    # Answer-assembly system prompt override, shared by train+val and by self_judge. null ->
+    # the reader falls back to its own default (RRG's info-retrieval framing, answer_prompt.txt).
+    # Set to e.g. prompts/answer_actionrecovery.txt for AndroidControl's blind
+    # action-sequence-recovery framing.
+    answer_prompt_path: null
     answer_max_tokens: 2048    # reader max_tokens for the generative answer assembly (bumped
                                # 1024->2048: 1024 truncated ~11% of assemblies on the 8B reader,
                                # zeroing those trajectory rewards; see rrg-reader-bottleneck)

@@ -157,7 +157,8 @@ class TaskRunner:
             common = dict(concurrency=rcfg.get('concurrency', 64),
                           data_kind=rcfg.get('data_kind', 'amex'),
                           train_task_root=rcfg.get('train_task_root', None),
-                          val_task_root=rcfg.get('val_task_root', None))
+                          val_task_root=rcfg.get('val_task_root', None),
+                          answer_prompt_path=rcfg.get('answer_prompt_path', None))
             # Train macro reward: 8B reader (logprobs path shares this host), bumped token
             # budget, and the completeness shaping (#3) applied to the reward written to the
             # tensor. Raw recall/correct are still logged unchanged.

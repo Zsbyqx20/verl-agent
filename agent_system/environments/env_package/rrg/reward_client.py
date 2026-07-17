@@ -156,7 +156,8 @@ def data_url(path_or_img, max_long: int) -> str:
 class RRGRewardClient:
     def __init__(self, base_url: str, model_name: str, max_image_long: int = 768,
                  num_distractors: int = 4, concurrency: int = 64, seed: int = 0,
-                 subtract_control: bool = False, api_key: str = "sk-dummy"):
+                 subtract_control: bool = False, api_key: str = "sk-dummy",
+                 answer_prompt_path: Optional[str] = None):
         self.base_url = base_url
         self.model = model_name
         self.max_image_long = max_image_long
@@ -165,6 +166,15 @@ class RRGRewardClient:
         self.subtract_control = subtract_control
         self.seed = seed
         self.api_key = api_key
+        # Answer-assembly system prompt override (e.g. AndroidControl's blind
+        # action-sequence-recovery framing instead of RRG's default info-retrieval one).
+        # None (default) -> _assemble_answer falls back to answer_recovery.ANSWER_PROMPT,
+        # byte-identical to the pre-existing hardcoded behavior.
+        if answer_prompt_path:
+            from pathlib import Path
+            self.answer_prompt = Path(answer_prompt_path).read_text(encoding="utf-8")
+        else:
+            self.answer_prompt = None
 
     def _client(self):
         from openai import AsyncOpenAI
@@ -294,6 +304,7 @@ class RRGRewardClient:
         (no screenshots). This is the answerability test: are the policy's notes sufficient
         to reconstruct the answer? Returns (answer_obj_or_None, parse_err)."""
         from agent_system.environments.env_package.rrg import answer_recovery as A
+        system_prompt = self.answer_prompt if self.answer_prompt is not None else A.ANSWER_PROMPT
         user = (f"# Task goal\n{goal}\n\n"
                 f"# Agent's step-by-step reasoning (its only memory of the trajectory)\n"
                 f"{_render_trace(reasonings)}\n\n"
@@ -301,7 +312,7 @@ class RRGRewardClient:
         async with sem:
             r = await self._retry(lambda: client.chat.completions.create(
                 model=self.model,
-                messages=[{"role": "system", "content": A.ANSWER_PROMPT},
+                messages=[{"role": "system", "content": system_prompt},
                           {"role": "user", "content": user}],
                 max_tokens=max_tokens, temperature=0.0))
         raw = r.choices[0].message.content or ""
