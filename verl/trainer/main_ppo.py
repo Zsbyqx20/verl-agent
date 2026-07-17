@@ -162,10 +162,14 @@ class TaskRunner:
             # Train macro reward: 8B reader (logprobs path shares this host), bumped token
             # budget, and the completeness shaping (#3) applied to the reward written to the
             # tensor. Raw recall/correct are still logged unchanged.
+            # Prefer the key from the environment (RRG_READER_KEY) so a real train-side API key
+            # never enters the Hydra config tree -- which verl prints to stdout AND uploads to
+            # swanlab. Mirrors the val-side RRG_VAL_READER_KEY handling below.
+            train_key = os.environ.get('RRG_READER_KEY') or rcfg.get('reader_key', 'sk-dummy')
             reward_fn = RRGTrajectoryRewardManager(
                 tokenizer=tokenizer, num_examine=0, is_val=False,
                 reader_url=rcfg.reader_url, reader_model=rcfg.reader_model,
-                reader_key=rcfg.get('reader_key', 'sk-dummy'),
+                reader_key=train_key,
                 answer_max_tokens=rcfg.get('answer_max_tokens', 2048),
                 traj_reward_shaping=rcfg.get('traj_reward_shaping', 'none'),
                 shaping_power=rcfg.get('shaping_power', 2.0),
@@ -189,8 +193,10 @@ class TaskRunner:
             v_model = rcfg.get('val_reader_model', None) or rcfg.reader_model
             # Prefer the key from the environment (RRG_VAL_READER_KEY) so the secret never
             # enters the Hydra config tree -- which verl prints to stdout AND uploads to swanlab.
+            # Falls back to the train-side env key/config before the plain-text yaml default, so
+            # a train-side RRG_READER_KEY is honored here too when val doesn't set its own.
             v_key = (os.environ.get('RRG_VAL_READER_KEY')
-                     or rcfg.get('val_reader_key', None) or rcfg.get('reader_key', 'sk-dummy'))
+                     or rcfg.get('val_reader_key', None) or train_key)
             v_max = rcfg.get('val_answer_max_tokens', None) or rcfg.get('answer_max_tokens', 2048)
             val_reward_fn = RRGTrajectoryRewardManager(
                 tokenizer=tokenizer, num_examine=1, is_val=True,

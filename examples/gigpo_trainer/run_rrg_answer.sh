@@ -40,6 +40,9 @@ ANSWER_MAX_TOKENS=${ANSWER_MAX_TOKENS:-2048}
 #    placed in the Hydra config (which verl prints to stdout AND uploads to swanlab). Launch with:
 #      RRG_VAL_READER_KEY=$OPENAI_API_KEY VAL_READER_URL=https://ark.cn-beijing.volces.com/api/v3 \
 #      VAL_READER_MODEL=doubao-seed-2-0-lite-260428 SWANLAB_MODE=local bash ...
+#    If the TRAIN-side reader also needs a real key, set RRG_READER_KEY the same way -- also never
+#    enters the config, and is used as val's fallback too when RRG_VAL_READER_KEY/VAL_READER_KEY
+#    aren't set.
 # reward reader (step-margin + trajectory answer-recovery). Override RRG_READER_URL if the 8B moved.
 READER_URL=${RRG_READER_URL:-http://117.74.66.190:10727/v1}
 VAL_READER_URL=${VAL_READER_URL:-null}
