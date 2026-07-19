@@ -104,6 +104,50 @@ def action_str(a: dict) -> str:
     return json.dumps(a, ensure_ascii=False)
 
 
+# Empirically observed action-type confusion pairs: which OTHER action type a trained model
+# is most likely to mistakenly predict for a given gold type, from the AndroidControl SSR
+# eval's confusion matrix (base Qwen3-VL-4B, AMEX-SFT-4B-backfilled agent, and RL-step40-
+# backfilled agent, aggregated over the same held-out 1255-step test set). click dominates as
+# the wrong guess for nearly everything -- it's the majority action by volume (~65% of all
+# steps), so it's the "safe default" whenever a model is unsure: wait->click 49.5%,
+# system_button->click 40.8%, open_app->click 23.4%, swipe->click 21.5%, type->click 16.5%.
+# click itself is most often mistaken for swipe (9.6%) or wait (5.4%). The plain uniform-random
+# cross-verb pool below doesn't deliberately include these -- this ordering does, so the
+# distractor set actually contains the confusions a model is likely to make, not just any
+# other action.
+CONFUSION_PRIORITY: Dict[str, List[str]] = {
+    "click": ["swipe", "wait", "system_button", "open_app"],
+    "long_press": ["click", "swipe"],
+    "swipe": ["click", "system_button", "wait"],
+    "type": ["click", "wait"],
+    "open_app": ["click", "system_button", "swipe"],
+    "wait": ["click", "swipe", "type", "open_app"],
+    "system_button": ["click", "open_app", "swipe"],
+}
+
+
+def _prioritized_cross(gt: str, v: str, pool: List[str], rng: random.Random) -> List[str]:
+    """Cross-verb distractor pool ordered by CONFUSION_PRIORITY (most-confused-for action
+    types first) instead of uniform-random. Falls back to plain shuffle for unlisted/legacy
+    (AMEX-only) types, same behavior as before this existed."""
+    by_verb: Dict[str, List[str]] = {}
+    for c in pool:
+        if c == gt:
+            continue
+        by_verb.setdefault(c.split("(", 1)[0], []).append(c)
+    ordered: List[str] = []
+    seen_verbs = set()
+    for verb in CONFUSION_PRIORITY.get(v, []):
+        items = by_verb.get(verb, [])
+        rng.shuffle(items)
+        ordered += items
+        seen_verbs.add(verb)
+    remaining = [c for verb, items in by_verb.items() if verb not in seen_verbs for c in items]
+    rng.shuffle(remaining)
+    ordered += remaining
+    return ordered
+
+
 def hard_distractors(a: dict, pool: List[str], rng: random.Random, k: int) -> List[str]:
     gt = action_str(a)
     v = a.get("action")
@@ -141,9 +185,7 @@ def hard_distractors(a: dict, pool: List[str], rng: random.Random, k: int) -> Li
         cands += [f"system_button({b})" for b in ANDROIDCONTROL_BUTTONS]
     # "wait" (AndroidControl) has no parameters -> no same-type near-miss is possible;
     # falls through to the cross-verb pool below like AMEX's other unhandled cases.
-    cross = [c for c in pool if c != gt]
-    rng.shuffle(cross)
-    cands += cross
+    cands += _prioritized_cross(gt, v, pool, rng)
     seen, out = {gt}, []
     for c in cands:
         if c not in seen:
