@@ -60,22 +60,43 @@ def validate_answer(answer: dict, schema: dict) -> list[str]:
 # --------------------------------------------------------------------------- #
 # Gold-answer loading from the source CSV + schema cache
 # --------------------------------------------------------------------------- #
+# _csv_row used to re-open and linearly re-scan the whole CSV on every call, and
+# load_gold called it a second time internally -> O(n^2) file I/O + comparisons
+# across a task-loop of n tasks (fine at AMEX's ~400 tasks, painfully slow once
+# AndroidControl-scale task-roots with 10000+ tasks reuse this same loader).
+# Fix: parse each CSV file into an (App, ID) -> row index once, cache it by path.
+_CSV_INDEX_CACHE: dict[str, dict[tuple[str, str], dict]] = {}
+
+
+def _csv_index(csv_path: Path) -> dict[tuple[str, str], dict]:
+    key = str(csv_path)
+    idx = _CSV_INDEX_CACHE.get(key)
+    if idx is None:
+        import csv as _csv
+        idx = {}
+        with open(csv_path, encoding="utf-8-sig") as f:
+            for r in _csv.DictReader(f):
+                idx[(r.get("App"), str(r.get("ID")))] = r
+        _CSV_INDEX_CACHE[key] = idx
+    return idx
+
+
 def _csv_row(csv_path: Path, env: str, task_id) -> dict | None:
-    """Find the source-CSV row for {env}:{task_id} (utf-8-sig strips the BOM on 'App')."""
-    import csv as _csv
+    """Find the source-CSV row for {env}:{task_id} (utf-8-sig strips the BOM on 'App').
+
+    O(1) after the first call per csv_path (cached index); see _csv_index."""
     if not csv_path or not csv_path.exists():
         return None
-    with open(csv_path, encoding="utf-8-sig") as f:
-        for r in _csv.DictReader(f):
-            if r.get("App") == str(env) and str(r.get("ID")) == str(task_id):
-                return r
-    return None
+    return _csv_index(csv_path).get((str(env), str(task_id)))
 
 
-def load_gold(csv_path: Path, env: str, task_id) -> dict | None:
-    """Parse the gold answer from the source CSV's 'Validate 备注' column."""
+def load_gold(csv_path: Path, env: str, task_id, row: dict | None = None) -> dict | None:
+    """Parse the gold answer from the source CSV's 'Validate 备注' column.
+
+    Pass `row` (already fetched via _csv_row, e.g. for resolve_goal_and_lang) to skip
+    the redundant second lookup."""
     import json5
-    r = _csv_row(csv_path, env, task_id)
+    r = row if row is not None else _csv_row(csv_path, env, task_id)
     if not r:
         return None
     raw = (r.get("Validate 备注") or "").strip()

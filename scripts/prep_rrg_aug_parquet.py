@@ -91,7 +91,7 @@ def load_runnable_tasks(task_root: Path) -> list[dict]:
         key = f"{env_id}-{tid}"
         row = A._csv_row(gold_csv, env_id, tid)
         goal, _lang = A.resolve_goal_and_lang(row, t.get("task"))
-        gold = A.load_gold(gold_csv, env_id, tid)
+        gold = A.load_gold(gold_csv, env_id, tid, row=row)
         schema = schema_cache.get(f"{env_id}:{tid}")
         if not (goal and gold and schema):
             skipped_no_gold_schema += 1

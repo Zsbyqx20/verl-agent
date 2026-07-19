@@ -60,7 +60,7 @@ def _load_rrg_episodes(task_root: str, num_episodes: int | None) -> List[Dict[st
         key = f"{env}-{tid}"
         row = A._csv_row(gold_csv, env, tid)
         goal, lang = A.resolve_goal_and_lang(row, t.get("task"))
-        gold = A.load_gold(gold_csv, env, tid)
+        gold = A.load_gold(gold_csv, env, tid, row=row)
         schema = schema_cache.get(f"{env}:{tid}")
         if not (goal and gold and schema):
             continue
