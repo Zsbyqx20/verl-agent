@@ -107,7 +107,7 @@ python3 -m verl.trainer.main_ppo \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
     data.max_prompt_length=32768 \
-    data.max_response_length=2048 \
+    data.max_response_length=768 \
     data.filter_overlong_prompts=False \
     data.truncation='error' \
     data.image_key=images \
@@ -119,8 +119,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_coef=0.02 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
@@ -130,9 +131,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
-    actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.free_cache_engine=False \
-    actor_rollout_ref.rollout.enforce_eager=False \
+    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
