@@ -110,7 +110,21 @@ def hard_distractors(a: dict, pool: List[str], rng: random.Random, k: int) -> Li
     cands: List[str] = []
     if v in ("click", "long_press"):
         x, y = a["coordinate"]
-        for dx, dy in [(300, 0), (-300, 0), (0, 400), (0, -400), (380, 380), (-380, -380)]:
+        # 2 "hard" near-misses placed just outside the ~140px SSR match tolerance (rather than
+        # only the far ones below, which let vague "top-right corner"-style reasoning pass the
+        # MC test without naming the actual target -- see rrg-androidcontrol click-regression
+        # finding). Offsets are scaled per axis (not a single symmetric value): AndroidControl
+        # screens are tall portraits (~1080x2400 dominant), so the same normalized-space delta
+        # is ~2.2x more actual pixels on Y than X; 140 on X and 65 on Y both land at ~150-160px
+        # real distance on that dominant profile. This is a fixed approximation (hard_distractors
+        # has no access to the actual per-image width/height), not exact for every screen.
+        # Listed BEFORE the far ones so they always survive the k truncation: at the default
+        # num_distractors=4 the selected set is [near1, near2, far1, far2] -- a real mix, not
+        # all-coarse and not all-fine (see the design discussion this implements). A higher
+        # num_distractors pulls in more of the far set too.
+        near_offsets = [(140, 0), (0, -65)]
+        far_offsets = [(300, 0), (-300, 0), (0, 400), (0, -400), (380, 380), (-380, -380)]
+        for dx, dy in near_offsets + far_offsets:
             nx, ny = min(990, max(10, x + dx)), min(990, max(10, y + dy))
             cands.append(f"{v}({nx}, {ny})")
     elif v == "swipe":
