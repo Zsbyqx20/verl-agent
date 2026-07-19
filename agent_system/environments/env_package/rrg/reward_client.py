@@ -62,6 +62,11 @@ PRESS_KEYS = ["BACK", "HOME", "ENTER", "APP_SWITCH", "MENU"]
 # --------------------------------------------------------------------------- #
 # Action canonicalization + hard distractors (ported from action_recovery_eval.py)
 # --------------------------------------------------------------------------- #
+# AMEX swipes carry two raw points (coordinate/coordinate2) with no direction field;
+# AndroidControl swipes (from androidcontrol_to_rrg_format.py's _androidcontrol_action)
+# already carry "direction" directly and have NO coordinate/coordinate2 at all -- calling
+# swipe_dir() on one raises KeyError. action_str() below checks for "direction" first so
+# both schemas work.
 def swipe_dir(a: dict) -> str:
     (x1, y1), (x2, y2) = a["coordinate"], a["coordinate2"]
     dx, dy = x2 - x1, y2 - y1
@@ -70,19 +75,32 @@ def swipe_dir(a: dict) -> str:
     return "left" if dx < 0 else "right"
 
 
+ANDROIDCONTROL_BUTTONS = ["back", "home"]
+
+
 def action_str(a: dict) -> str:
     v = a.get("action")
     if v == "click":
         x, y = a["coordinate"]
         return f"click({x}, {y})"
+    if v == "long_press":  # AndroidControl: same coordinate schema as click
+        x, y = a["coordinate"]
+        return f"long_press({x}, {y})"
     if v == "type":
         return f'type("{a.get("text", "")}")'
     if v == "swipe":
-        return f"swipe({swipe_dir(a)})"
+        direction = a["direction"] if "direction" in a else swipe_dir(a)
+        return f"swipe({direction})"
     if v == "terminate":
         return f"terminate({a.get('status', 'success')})"
     if v == "press_key":
         return f"press_key({a.get('key', '')})"
+    if v == "open_app":  # AndroidControl
+        return f'open_app("{a.get("app", "")}")'
+    if v == "wait":  # AndroidControl
+        return "wait()"
+    if v == "system_button":  # AndroidControl
+        return f"system_button({a.get('button', '')})"
     return json.dumps(a, ensure_ascii=False)
 
 
@@ -90,11 +108,11 @@ def hard_distractors(a: dict, pool: List[str], rng: random.Random, k: int) -> Li
     gt = action_str(a)
     v = a.get("action")
     cands: List[str] = []
-    if v == "click":
+    if v in ("click", "long_press"):
         x, y = a["coordinate"]
         for dx, dy in [(300, 0), (-300, 0), (0, 400), (0, -400), (380, 380), (-380, -380)]:
             nx, ny = min(990, max(10, x + dx)), min(990, max(10, y + dy))
-            cands.append(f"click({nx}, {ny})")
+            cands.append(f"{v}({nx}, {ny})")
     elif v == "swipe":
         cands += [f"swipe({d})" for d in ("up", "down", "left", "right")]
     elif v == "press_key":
@@ -103,6 +121,12 @@ def hard_distractors(a: dict, pool: List[str], rng: random.Random, k: int) -> Li
         cands += ["terminate(failure)", "terminate(success)"]
     elif v == "type":
         cands += ['type("search")', 'type("home")', 'type("settings")', 'type("login")']
+    elif v == "open_app":  # AndroidControl: reuse other apps' real names from the global pool
+        cands += [c for c in pool if c.startswith("open_app(")]
+    elif v == "system_button":  # AndroidControl
+        cands += [f"system_button({b})" for b in ANDROIDCONTROL_BUTTONS]
+    # "wait" (AndroidControl) has no parameters -> no same-type near-miss is possible;
+    # falls through to the cross-verb pool below like AMEX's other unhandled cases.
     cross = [c for c in pool if c != gt]
     rng.shuffle(cross)
     cands += cross
