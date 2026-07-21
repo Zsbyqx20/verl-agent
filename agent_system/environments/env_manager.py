@@ -640,7 +640,11 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                 num_distractors=rcfg.get("num_distractors", 4),
                 concurrency=rcfg.get("concurrency", 64),
                 subtract_control=rcfg.get("subtract_control", False),
-                answer_prompt_path=rcfg.get("answer_prompt_path", None))
+                answer_prompt_path=rcfg.get("answer_prompt_path", None),
+                step_reward_mode=rcfg.get("step_reward_mode", "mc"),
+                gen_max_tokens=rcfg.get("gen_max_tokens", 64),
+                gen_n=rcfg.get("gen_n", 8),
+                gen_temperature=rcfg.get("gen_temperature", 0.8))
         else:
             self.reward_client = None  # created lazily in set_self_judge_wg()
         self.coord_tol = rcfg.get("coord_tol", 8)

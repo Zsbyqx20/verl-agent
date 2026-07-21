@@ -84,6 +84,15 @@ REPETITION_PENALTY=${REPETITION_PENALTY:-false}    # true to enable
 REPETITION_PENALTY_W=${REPETITION_PENALTY_W:-1.0}
 REPETITION_LOOKBACK=${REPETITION_LOOKBACK:-15}
 REPETITION_THRESHOLD=${REPETITION_THRESHOLD:-0.97}
+# step (micro) reward mode: mc (default, K-way forced-choice) | gen (reader open-generates the
+# next action from screenshot+reasoning with the goal WITHHELD, scored SSR-style vs gold; see
+# rrg-androidcontrol-gen-step-reward). Off by default -- validated against a 32B-class reader,
+# not the 8B READER_URL default above; point STEP_REWARD_READER_URL/_MODEL at a stronger reader
+# when enabling. Requires step_advantage_w>0 (already 1.0 below); main_ppo warns otherwise.
+STEP_REWARD_MODE=${STEP_REWARD_MODE:-mc}           # mc|gen
+GEN_MAX_TOKENS=${GEN_MAX_TOKENS:-64}
+GEN_N=${GEN_N:-8}
+GEN_TEMPERATURE=${GEN_TEMPERATURE:-0.8}
 # teacher-demo injection (EXPLORATION); off by default. TEACHER_DATA_PATH=<store.json> + TEACHER_SEED_K>0 enables.
 TEACHER_DATA_PATH=${TEACHER_DATA_PATH:-null}
 TEACHER_SEED_K=${TEACHER_SEED_K:-0}
@@ -169,6 +178,10 @@ python3 -m verl.trainer.main_ppo \
     env.rrg.repetition_penalty_w=$REPETITION_PENALTY_W \
     env.rrg.repetition_lookback=$REPETITION_LOOKBACK \
     env.rrg.repetition_threshold=$REPETITION_THRESHOLD \
+    env.rrg.step_reward_mode=$STEP_REWARD_MODE \
+    env.rrg.gen_max_tokens=$GEN_MAX_TOKENS \
+    env.rrg.gen_n=$GEN_N \
+    env.rrg.gen_temperature=$GEN_TEMPERATURE \
     env.rrg.teacher_data_path=$TEACHER_DATA_PATH \
     env.rrg.teacher_seed_k=$TEACHER_SEED_K \
     env.rrg.teacher_anneal_end_step=$TEACHER_ANNEAL_END_STEP \

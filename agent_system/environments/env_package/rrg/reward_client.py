@@ -104,6 +104,130 @@ def action_str(a: dict) -> str:
     return json.dumps(a, ensure_ascii=False)
 
 
+# --------------------------------------------------------------------------- #
+# Open-generation step reward (action-recovery SSR margin).
+#
+# Instead of a K-way MC over [gold + distractors], the reader GENERATES the next action
+# (same DSL as action_str) given goal + screenshot + reasoning; we score that generated
+# action against gold with an SSR-style match (exact action-type + params; smooth distance
+# decay for click/long_press coordinates; soft text score for type). The reward passed to
+# GiGPO is the MARGIN score(reasoning) - score(control): what the reasoning adds ON TOP OF
+# the screenshot the reader already sees (== what it would add for the sighted downstream
+# agent). This drops the fragile hand-tuned distractor machinery entirely.
+#
+# Coordinate handling: gold coords in tasks.json are ALREADY in 0-1000 NORMALIZED space
+# (empirically x,y p99 ~944/947, max ~1000; the SSR eval treats them as 0-1000 and scales
+# BOTH gold and prediction up by W/H before its pixel-threshold compare). The reader is
+# instructed to emit 0-1000 coords too, so gold and prediction share one space -- compute a
+# single isotropic Euclidean distance directly, NO per-image W/H normalization. tau=90 ->
+# reward ~exp(-1)=0.37 at 90 normalized units; the eval's 140px threshold is ~130 units on X
+# and ~58 on Y for a 1080x2400 screen, so tau=90 straddles the eval boundary isotropically.
+# --------------------------------------------------------------------------- #
+STEP_GEN_SYSTEM = (
+    "You are a GUI agent operating an Android phone. Given the current screenshot and the "
+    "agent's reasoning for this step, output the single next action to "
+    "take. Use exactly one of these forms and nothing else:\n"
+    "  open_app(\"AppName\")\n  click(x, y)\n  long_press(x, y)\n  type(\"text\")\n"
+    "  swipe(direction)   # direction in up/down/left/right\n"
+    "  system_button(button)   # button in back/home\n  wait()\n"
+    "Coordinates x, y are integers normalized to 0-1000 on both axes (0,0 = top-left)."
+)
+COORD_TAU = 90.0  # 0-1000-space distance scale for the click/long_press decay
+
+_GEN_ACT_RE = re.compile(
+    r'(open_app|click|long_press|type|swipe|system_button|wait)\s*\(([^)]*)\)', re.IGNORECASE)
+
+
+def parse_gen_action(raw: str) -> Optional[dict]:
+    """Parse the reader's generated action DSL back into an action dict (last match wins,
+    so trailing chatter before the call still parses). Returns None if unparseable."""
+    if not raw:
+        return None
+    matches = list(_GEN_ACT_RE.finditer(raw))
+    if not matches:
+        return None
+    m = matches[-1]
+    verb = m.group(1).lower()
+    arg = m.group(2).strip()
+    try:
+        if verb in ("click", "long_press"):
+            parts = [p.strip() for p in arg.split(",")]
+            if len(parts) != 2:
+                return None
+            return {"action": verb, "coordinate": [float(parts[0]), float(parts[1])]}
+        if verb == "type":
+            return {"action": "type", "text": arg.strip().strip('"\'')}
+        if verb == "swipe":
+            return {"action": "swipe", "direction": arg.strip().strip('"\'').lower()}
+        if verb == "system_button":
+            return {"action": "system_button", "button": arg.strip().strip('"\'').lower()}
+        if verb == "open_app":
+            return {"action": "open_app", "app": arg.strip().strip('"\'')}
+        if verb == "wait":
+            return {"action": "wait"}
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+def _text_score(pred: str, gold: str) -> float:
+    """Soft text match for type() content: token-level F1 (case/space-insensitive), so
+    right-entity-wrong-surface-form ('Miami' vs 'miami florida') gets partial credit."""
+    pt = (pred or "").lower().split()
+    gt = (gold or "").lower().split()
+    if not pt and not gt:
+        return 1.0
+    if not pt or not gt:
+        return 0.0
+    from collections import Counter
+    cp, cg = Counter(pt), Counter(gt)
+    overlap = sum((cp & cg).values())
+    if overlap == 0:
+        return 0.0
+    prec, rec = overlap / len(pt), overlap / len(gt)
+    return 2 * prec * rec / (prec + rec)
+
+
+def score_gen_action(pred: Optional[dict], gold: dict, img_wh: tuple) -> float:
+    """SSR-style score in [0,1] of a generated action vs gold. Action-type must match
+    (else 0). Then: click/long_press -> exp(-d/tau) on the single isotropic distance in
+    0-1000 normalized space; type -> token-F1 on text; open_app/swipe/system_button/wait
+    -> exact categorical (1/0)."""
+    if pred is None:
+        return 0.0
+    gv, pv = gold.get("action"), pred.get("action")
+    if pv != gv:
+        return 0.0
+    if gv in ("click", "long_press"):
+        gx, gy = gold["coordinate"]   # already 0-1000 (see module note above)
+        px, py = pred["coordinate"]   # reader emits 0-1000
+        d = math.hypot(px - gx, py - gy)
+        return math.exp(-d / COORD_TAU)
+    if gv == "type":
+        return _text_score(pred.get("text", ""), gold.get("text", ""))
+    if gv == "swipe":
+        return 1.0 if pred.get("direction") == gold.get("direction") else 0.0
+    if gv == "system_button":
+        return 1.0 if pred.get("button") == gold.get("button") else 0.0
+    if gv == "open_app":
+        return 1.0 if (pred.get("app", "").lower() == gold.get("app", "").lower()) else 0.0
+    if gv == "wait":
+        return 1.0
+    return 0.0
+
+
+def _build_gen_text(reasoning: Optional[str]) -> str:
+    """NOTE: the task GOAL is deliberately WITHHELD. With the goal present, a sighted reader
+    infers the task-relevant action from goal+screenshot and ignores the reasoning -> the
+    reasoning earns ~0 margin on click/open_app/type (screenshot-dominated). Withholding the
+    goal makes the reasoning the SOLE carrier of intent: reasoning that names the target/app/
+    text earns large margin vs content-free control, while a screenshot-obvious single-button
+    step correctly still earns ~0 (no reasoning contribution). Validated on a mixed-action
+    sample: mean margin ~0 (with goal) -> ~0.57 (no goal), open_app/click/type all opened up."""
+    rblock = f"Agent's reasoning for this step:\n{reasoning}\n\n" if reasoning else ""
+    return (f"{rblock}Output the single next action now.")
+
+
 # Empirically observed action-type confusion pairs: which OTHER action type a trained model
 # is most likely to mistakenly predict for a given gold type, from the AndroidControl SSR
 # eval's confusion matrix (base Qwen3-VL-4B, AMEX-SFT-4B-backfilled agent, and RL-step40-
@@ -237,7 +361,9 @@ class RRGRewardClient:
     def __init__(self, base_url: str, model_name: str, max_image_long: int = 768,
                  num_distractors: int = 4, concurrency: int = 64, seed: int = 0,
                  subtract_control: bool = False, api_key: str = "sk-dummy",
-                 answer_prompt_path: Optional[str] = None):
+                 answer_prompt_path: Optional[str] = None,
+                 step_reward_mode: str = "mc", gen_max_tokens: int = 64,
+                 gen_n: int = 8, gen_temperature: float = 0.8):
         self.base_url = base_url
         self.model = model_name
         self.max_image_long = max_image_long
@@ -246,6 +372,28 @@ class RRGRewardClient:
         self.subtract_control = subtract_control
         self.seed = seed
         self.api_key = api_key
+        # Step-reward mode:
+        #   "mc"  (default, byte-identical prior behavior): K-way forced-choice over
+        #         gold+distractors, score = renormalized P(gold letter). Optional
+        #         subtract_control margin.
+        #   "gen": reader OPEN-GENERATES the next action from screenshot+reasoning with the GOAL
+        #         WITHHELD (see _build_gen_text -- withholding the goal is what makes the reasoning
+        #         the sole carrier of intent, so reasoning that names the target earns signal).
+        #         Score = SSR-style match vs gold (score_gen_action). Per rollout we draw gen_n
+        #         samples at gen_temperature and use the MEAN SSR (expectation over the reader's
+        #         action distribution given the reasoning -> smooth/continuous even for categorical
+        #         actions; vLLM shares the image prefill across the n samples so it's ~15% over a
+        #         single greedy call, not n x). NO explicit content-free control call: GiGPO's
+        #         step_norm_reward subtracts the anchor-group mean (all G rollouts at a step share
+        #         the same screenshot+gold), which removes the screenshot-obviousness baseline that
+        #         control was there to subtract -- so control is redundant on the micro channel.
+        #         *** This redundancy holds ONLY on the step/micro channel with step_advantage_w>0;
+        #         if the micro channel is off, raw mean-SSR leaks the screenshot baseline. The
+        #         env/trainer should guard on that (warn if gen mode + step_advantage_w==0). ***
+        self.step_reward_mode = step_reward_mode
+        self.gen_max_tokens = gen_max_tokens
+        self.gen_n = max(1, int(gen_n))
+        self.gen_temperature = float(gen_temperature)
         # Answer-assembly system prompt override (e.g. AndroidControl's blind
         # action-sequence-recovery framing instead of RRG's default info-retrieval one).
         # None (default) -> _assemble_answer falls back to answer_recovery.ANSWER_PROMPT,
@@ -338,9 +486,48 @@ class RRGRewardClient:
         margin = P(correct|reasoning) [- P(correct|control) if subtract_control]."""
         return asyncio.run(self._score_step_margins(items, action_pool))
 
+    async def _gen_score(self, client, sem, durl, gold, img_wh, reasoning) -> float:
+        """Reader open-generates the next action from screenshot+reasoning (GOAL WITHHELD --
+        see _build_gen_text). Draws gen_n samples in ONE call (vLLM shares the image prefill,
+        so ~15% over a single greedy call, not n x) and returns the MEAN SSR-style match vs
+        gold in [0,1] -- an estimate of E[SSR] over the reader's action distribution given the
+        reasoning, so categorical actions become continuous and clicks reward tight clustering.
+        gen_n=1 with gen_temperature=0 recovers greedy single-sample scoring."""
+        text = _build_gen_text(reasoning)
+        n = self.gen_n
+        async with sem:
+            r = await self._retry(lambda: client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": STEP_GEN_SYSTEM},
+                          {"role": "user", "content": [
+                              {"type": "image_url", "image_url": {"url": durl}},
+                              {"type": "text", "text": text}]}],
+                max_tokens=self.gen_max_tokens,
+                temperature=(self.gen_temperature if n > 1 else 0.0), n=n))
+        scores = [score_gen_action(parse_gen_action(ch.message.content or ""), gold, img_wh)
+                  for ch in r.choices]
+        return sum(scores) / len(scores) if scores else 0.0
+
     async def _score_step_margins(self, items, action_pool):
         client, sem = self._client(), asyncio.Semaphore(self.concurrency)
         rng = random.Random(self.seed)
+
+        if self.step_reward_mode == "gen":
+            # Open-generation mean-SSR, ONE call per rollout (gen_n samples averaged inside
+            # _gen_score). No explicit control call: GiGPO's step_norm_reward subtracts the
+            # anchor-group mean, which removes the shared screenshot-obviousness baseline that
+            # a control would subtract (see __init__ note + the step_advantage_w>0 guard).
+            jobs = []
+            for it in items:
+                im = Image.open(it["image"]).convert("RGB") if isinstance(it["image"], str) \
+                    else it["image"].convert("RGB")
+                durl = data_url(im, self.max_image_long)
+                jobs.append(self._gen_score(client, sem, durl, it["action"], im.size,
+                                            it.get("reasoning") or None))
+            res = await asyncio.gather(*jobs, return_exceptions=True)
+            return [0.0 if isinstance(v, Exception) else float(v) for v in res]
+
+        # default: MC forced-choice (unchanged)
         jobs, meta = [], []
         for idx, it in enumerate(items):
             a = it["action"]

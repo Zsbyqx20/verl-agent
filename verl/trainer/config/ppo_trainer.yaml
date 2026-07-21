@@ -364,6 +364,19 @@ env:
     coord_tol: 8               # px tolerance for the coordinate-leakage veto
     concurrency: 64            # async reward calls in flight
     subtract_control: false    # subtract a content-free control from the step margin
+    # --- step (micro) reward mode ---
+    #   mc  (default) -> K-way forced-choice over gold+distractors, byte-identical to prior behavior.
+    #   gen -> reader OPEN-GENERATES the next action from screenshot+reasoning with the goal
+    #          WITHHELD, scored SSR-style vs gold (distance-decay clicks, token-F1 type,
+    #          categorical otherwise). Requires algorithm.gigpo.step_advantage_w>0 (GiGPO's
+    #          step group-mean normalization removes the screenshot-obviousness baseline that
+    #          the old mc mode's subtract_control was there for; main_ppo warns if the guard
+    #          isn't satisfied). Validated with a 32B-class reader; the default 8B reader_url
+    #          above may be too weak to ground gen mode reliably.
+    step_reward_mode: mc
+    gen_max_tokens: 64         # reader max_tokens for one generated action
+    gen_n: 8                   # samples per rollout-step, averaged into a mean-SSR score
+    gen_temperature: 0.8       # sampling temp for gen_n>1 (gen_n=1 falls back to greedy/temp=0)
     system_prompt_file: null   # match the SFT system prompt (prompts/system_amex.txt)
     # Teacher-demo injection (EXPLORATION): seed the first teacher_seed_k slots of each group with a
     # verified teacher trajectory so the policy learns note-taking it can't produce on its own. TRAIN only.
