@@ -200,9 +200,11 @@ class TaskRunner:
                 repetition_penalty_w=rcfg.get('repetition_penalty_w', 1.0),
                 repetition_lookback=rcfg.get('repetition_lookback', 15),
                 repetition_threshold=rcfg.get('repetition_threshold', 0.97),
+                traj_reward_weight=rcfg.get('traj_reward_weight', 1.0),
                 processor=processor, **common)
-            # Val/eval reward: optional stronger reader (doubao) for an accurate test_score,
-            # and shaping FORCED OFF so val/rrg/test_score stays raw recall (a comparable metric).
+            # Val/eval reward: optional stronger reader (doubao) for an accurate test_score, and
+            # shaping FORCED OFF + weight FORCED to 1.0 so val/rrg/test_score stays raw recall (a
+            # comparable metric) regardless of the train-side traj_reward_weight/shaping knobs.
             v_url = rcfg.get('val_reader_url', None) or rcfg.reader_url
             v_model = rcfg.get('val_reader_model', None) or rcfg.reader_model
             # Prefer the key from the environment (RRG_VAL_READER_KEY) so the secret never

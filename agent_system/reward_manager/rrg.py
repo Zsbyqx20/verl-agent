@@ -87,11 +87,22 @@ class RRGTrajectoryRewardManager:
                  clamp_negative: bool = True, repetition_penalty: bool = False,
                  repetition_penalty_w: float = 1.0, repetition_lookback: int = 15,
                  repetition_threshold: float = 0.97, processor=None,
-                 answer_prompt_path: str | None = None, **kwargs) -> None:
+                 answer_prompt_path: str | None = None,
+                 traj_reward_weight: float = 1.0, **kwargs) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
         self.data_kind = data_kind
         self.answer_max_tokens = answer_max_tokens
+        # Scales the reward WRITTEN to reward_tensor (the GiGPO macro/episode channel). Raw
+        # recall/correct (row_recall/row_correct, the research metric) are logged UNSCALED
+        # regardless -- this only controls how much the trajectory answer-recovery signal
+        # contributes to the policy gradient. 0.0 mutes the channel (still computed, so
+        # GiGPO's episode normalization sees a non-degenerate -- if constant-zero -- input)
+        # without ripping out the reader call or the reward-manager code path. See
+        # rrg-androidcontrol-reward-redesign: AndroidControl has dense per-step gold, so the
+        # trajectory channel is a proxy for something the (new) gen step reward already
+        # measures directly, and it's implicated in the answer-recovery/SSR decoupling.
+        self.traj_reward_weight = float(traj_reward_weight)
         # Answer-assembly system prompt override (e.g. AndroidControl's blind
         # action-sequence-recovery framing instead of RRG's default). None -> the reward
         # client falls back to its own hardcoded default, byte-identical to prior behavior.
@@ -140,17 +151,20 @@ class RRGTrajectoryRewardManager:
                     "answer_prompt_path": self.answer_prompt_path})
 
     def _shape(self, recall: float, correct: bool) -> float:
-        """Map raw answer-recovery recall (+correct) to the GiGPO macro reward (#3).
-        Pushes the policy toward COMPLETE answers, not just easy-field recall. Raw
-        recall/correct are still logged separately as the research metric."""
+        """Map raw answer-recovery recall (+correct) to the GiGPO macro reward (#3), then
+        apply traj_reward_weight. Pushes the policy toward COMPLETE answers, not just easy-
+        field recall. Raw recall/correct are still logged separately, UNWEIGHTED, as the
+        research metric -- only what lands in reward_tensor is scaled."""
         s = self.traj_reward_shaping
         if s == "square":
-            return float(recall) ** self.shaping_power
-        if s == "correct_bonus":
-            return float(recall) + self.correct_bonus_lambda * (1.0 if correct else 0.0)
-        if s == "threshold":
-            return float(recall) + (self.threshold_bonus if recall >= self.recall_threshold else 0.0)
-        return float(recall)  # "none"
+            shaped = float(recall) ** self.shaping_power
+        elif s == "correct_bonus":
+            shaped = float(recall) + self.correct_bonus_lambda * (1.0 if correct else 0.0)
+        elif s == "threshold":
+            shaped = float(recall) + (self.threshold_bonus if recall >= self.recall_threshold else 0.0)
+        else:
+            shaped = float(recall)  # "none"
+        return shaped * self.traj_reward_weight
 
     def _step_credits(self, pr) -> list:
         """Per-step answer-field credit c_t from a score_prefix_recovery result.

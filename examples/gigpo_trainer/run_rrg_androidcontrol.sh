@@ -93,6 +93,11 @@ STEP_REWARD_MODE=${STEP_REWARD_MODE:-mc}           # mc|gen
 GEN_MAX_TOKENS=${GEN_MAX_TOKENS:-64}
 GEN_N=${GEN_N:-8}
 GEN_TEMPERATURE=${GEN_TEMPERATURE:-0.8}
+# trajectory (macro) reward weight; 1.0 = current behavior. See rrg-androidcontrol-reward-
+# redesign for why this may want to go to 0 on AndroidControl once step_reward_mode=gen is
+# actually trained (dense per-step gold makes the macro channel a redundant/decoupled proxy).
+# Left at 1.0 here -- zeroing it is a deliberate experiment decision, not a wiring default.
+TRAJ_REWARD_WEIGHT=${TRAJ_REWARD_WEIGHT:-1.0}
 # teacher-demo injection (EXPLORATION); off by default. TEACHER_DATA_PATH=<store.json> + TEACHER_SEED_K>0 enables.
 TEACHER_DATA_PATH=${TEACHER_DATA_PATH:-null}
 TEACHER_SEED_K=${TEACHER_SEED_K:-0}
@@ -182,6 +187,7 @@ python3 -m verl.trainer.main_ppo \
     env.rrg.gen_max_tokens=$GEN_MAX_TOKENS \
     env.rrg.gen_n=$GEN_N \
     env.rrg.gen_temperature=$GEN_TEMPERATURE \
+    env.rrg.traj_reward_weight=$TRAJ_REWARD_WEIGHT \
     env.rrg.teacher_data_path=$TEACHER_DATA_PATH \
     env.rrg.teacher_seed_k=$TEACHER_SEED_K \
     env.rrg.teacher_anneal_end_step=$TEACHER_ANNEAL_END_STEP \

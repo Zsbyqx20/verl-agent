@@ -394,6 +394,14 @@ env:
     correct_bonus_lambda: 0.5
     recall_threshold: 0.9
     threshold_bonus: 0.5
+    # Scales the trajectory (macro/episode) reward written to reward_tensor. 1.0 = current
+    # behavior. 0.0 mutes the macro channel (still computed -- the reader call, recall/correct
+    # logging, and GiGPO's episode normalization all still run against a constant zero) without
+    # deleting the reward-manager code path. Val/test_score always uses weight 1.0 regardless of
+    # this, so it stays a comparable raw-recall metric across runs. See rrg-androidcontrol-
+    # reward-redesign: for domains with dense per-step gold (AndroidControl), the macro channel
+    # can become a redundant/decoupled proxy once the step channel has direct action supervision.
+    traj_reward_weight: 1.0
     # --- per-step answer-field credit (GiGPO MICRO channel) ---
     # Reward each step for the gold answer-fields that FIRST become recoverable from the notes
     # at that step (per-field temporal credit assignment). The blind reader assembles the answer
