@@ -24,6 +24,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -65,19 +66,26 @@ def validate_answer(answer: dict, schema: dict) -> list[str]:
 # across a task-loop of n tasks (fine at AMEX's ~400 tasks, painfully slow once
 # AndroidControl-scale task-roots with 10000+ tasks reuse this same loader).
 # Fix: parse each CSV file into an (App, ID) -> row index once, cache it by path.
+# Locked (not just dict-atomic) since _load_rrg_episodes now populates this cache from a
+# thread pool -- without the lock, N threads racing on a cold cache would each redundantly
+# open and parse the same CSV before any of them publish it.
 _CSV_INDEX_CACHE: dict[str, dict[tuple[str, str], dict]] = {}
+_CSV_INDEX_LOCK = threading.Lock()
 
 
 def _csv_index(csv_path: Path) -> dict[tuple[str, str], dict]:
     key = str(csv_path)
     idx = _CSV_INDEX_CACHE.get(key)
     if idx is None:
-        import csv as _csv
-        idx = {}
-        with open(csv_path, encoding="utf-8-sig") as f:
-            for r in _csv.DictReader(f):
-                idx[(r.get("App"), str(r.get("ID")))] = r
-        _CSV_INDEX_CACHE[key] = idx
+        with _CSV_INDEX_LOCK:
+            idx = _CSV_INDEX_CACHE.get(key)
+            if idx is None:
+                import csv as _csv
+                idx = {}
+                with open(csv_path, encoding="utf-8-sig") as f:
+                    for r in _csv.DictReader(f):
+                        idx[(r.get("App"), str(r.get("ID")))] = r
+                _CSV_INDEX_CACHE[key] = idx
     return idx
 
 

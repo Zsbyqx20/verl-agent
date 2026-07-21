@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -30,6 +32,65 @@ import numpy as np
 
 def _parse_action(a) -> dict:
     return a if isinstance(a, dict) else ast.literal_eval(a)
+
+
+def _build_rrg_task(t: dict, root: Path, gold_csv, schema_cache: dict) -> Dict[str, Any] | None:
+    """Build one task's episode dict, or None if it's not answer-bearing / has no frames.
+
+    All of a task's steps live in ONE image directory (verified across the full
+    AndroidControl corpus), so we list that directory ONCE and check membership in-memory
+    instead of stat-ing every step's image individually -- the dominant cost on a network
+    filesystem (JuiceFS) is round-trips, not bytes. Falls back to a per-file is_file() check
+    for any step whose image unexpectedly lives outside that directory.
+    """
+    from agent_system.environments.env_package.rrg import answer_recovery as A
+
+    env, tid = t["env_id"], t.get("task_id")
+    key = f"{env}-{tid}"
+    row = A._csv_row(gold_csv, env, tid)
+    goal, lang = A.resolve_goal_and_lang(row, t.get("task"))
+    gold = A.load_gold(gold_csv, env, tid, row=row)
+    schema = schema_cache.get(f"{env}:{tid}")
+    steps = t.get("steps")
+    if not (goal and gold and schema and steps):
+        return None
+
+    parent = (root / steps[0]["image"]).parent
+    try:
+        listing = set(os.listdir(parent))
+    except OSError:
+        listing = set()
+
+    frames = []
+    for s in steps:
+        try:
+            action = _parse_action(s["action"])
+        except (ValueError, SyntaxError):
+            continue
+        img = root / s["image"]
+        if img.parent == parent:
+            if img.name not in listing:
+                continue
+        elif not img.is_file():
+            continue
+        frames.append({
+            "task_id": key,
+            "step_idx": len(frames),          # contiguous 0-based replay index
+            "goal": goal,
+            "action": action,
+            "image_path": str(img),
+            "lang": lang,
+            "gold": gold,
+            "schema": schema,
+        })
+    if not frames:
+        return None
+    for fr in frames:
+        fr["num_steps"] = len(frames)
+    return {"task_id": key, "frames": frames, "gold": gold, "schema": schema, "goal": goal}
+
+
+_LOAD_CONCURRENCY = 32  # bounded thread pool for the per-task directory listing (I/O-bound)
 
 
 def _load_rrg_episodes(task_root: str, num_episodes: int | None) -> List[Dict[str, Any]]:
@@ -45,6 +106,11 @@ def _load_rrg_episodes(task_root: str, num_episodes: int | None) -> List[Dict[st
     the SFT jsonl, not needed here -- the policy generates the reasoning). So we keep every
     step that has a parseable action and an on-disk screenshot; we do NOT filter on reasoning.
     Only tasks with both a gold answer and a schema are kept (answer-recovery needs both).
+
+    Processes tasks in bounded batches through a thread pool (I/O-bound directory listings,
+    not CPU) and stops as soon as `num_episodes` are collected, instead of scanning the whole
+    corpus and truncating at the end -- on a network filesystem (JuiceFS) with a 10k+-task
+    corpus and num_episodes in the hundreds/low-thousands, this is the dominant cost.
     """
     from agent_system.environments.env_package.rrg import answer_recovery as A
 
@@ -54,44 +120,21 @@ def _load_rrg_episodes(task_root: str, num_episodes: int | None) -> List[Dict[st
     raw = json.loads((root / "tasks.json").read_text(encoding="utf-8"))
     raw.sort(key=lambda t: (str(t["env_id"]), str(t.get("task_id"))))  # deterministic
 
-    episodes = []
-    for t in raw:
-        env, tid = t["env_id"], t.get("task_id")
-        key = f"{env}-{tid}"
-        row = A._csv_row(gold_csv, env, tid)
-        goal, lang = A.resolve_goal_and_lang(row, t.get("task"))
-        gold = A.load_gold(gold_csv, env, tid, row=row)
-        schema = schema_cache.get(f"{env}:{tid}")
-        if not (goal and gold and schema):
-            continue
-        frames = []
-        for s in t["steps"]:
-            try:
-                action = _parse_action(s["action"])
-            except (ValueError, SyntaxError):
-                continue
-            img = root / s["image"]
-            if not img.is_file():
-                continue
-            frames.append({
-                "task_id": key,
-                "step_idx": len(frames),          # contiguous 0-based replay index
-                "goal": goal,
-                "action": action,
-                "image_path": str(img),
-                "lang": lang,
-                "gold": gold,
-                "schema": schema,
-            })
-        if frames:
-            for fr in frames:
-                fr["num_steps"] = len(frames)
-            episodes.append({"task_id": key, "frames": frames,
-                             "gold": gold, "schema": schema, "goal": goal})
+    episodes: List[Dict[str, Any]] = []
+    limit = num_episodes if (num_episodes is not None and num_episodes > 0) else None
+    with ThreadPoolExecutor(max_workers=_LOAD_CONCURRENCY) as pool:
+        for i in range(0, len(raw), _LOAD_CONCURRENCY):
+            if limit is not None and len(episodes) >= limit:
+                break
+            batch = raw[i:i + _LOAD_CONCURRENCY]
+            for ep in pool.map(_build_rrg_task, batch,
+                               [root] * len(batch), [gold_csv] * len(batch),
+                               [schema_cache] * len(batch)):
+                if ep is not None:
+                    episodes.append(ep)
 
-    episodes.sort(key=lambda e: e["task_id"])  # deterministic order
-    if num_episodes is not None and num_episodes > 0:
-        episodes = episodes[:num_episodes]
+    if limit is not None:
+        episodes = episodes[:limit]
     return episodes
 
 
