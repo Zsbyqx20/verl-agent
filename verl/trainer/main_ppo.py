@@ -158,14 +158,15 @@ class TaskRunner:
             # on GiGPO's step (micro) group-mean normalization to remove the screenshot-obviousness
             # baseline. That only happens when the micro channel is active (step_advantage_w>0). If
             # it's off, raw mean-SSR leaks that baseline straight into the reward.
-            if rcfg.get('step_reward_mode', 'mc') == 'gen':
+            if rcfg.get('step_reward_mode', 'mc') in ('gen', 'student'):
                 _saw = config.algorithm.get('gigpo', {}).get('step_advantage_w', 0.0) \
                     if hasattr(config.algorithm, 'get') else getattr(
                         getattr(config.algorithm, 'gigpo', None), 'step_advantage_w', 0.0)
                 if not _saw or float(_saw) <= 0.0:
-                    print("[rrg][WARN] step_reward_mode='gen' relies on GiGPO micro-channel "
+                    _mode = rcfg.get('step_reward_mode', 'mc')
+                    print(f"[rrg][WARN] step_reward_mode='{_mode}' relies on GiGPO micro-channel "
                           "group-norm to remove the screenshot baseline, but "
-                          f"algorithm.gigpo.step_advantage_w={_saw} (<=0). The gen reward will "
+                          f"algorithm.gigpo.step_advantage_w={_saw} (<=0). The reward will "
                           "leak the screenshot-obviousness baseline. Set step_advantage_w>0 or "
                           "use step_reward_mode='mc' with subtract_control.", flush=True)
             common = dict(concurrency=rcfg.get('concurrency', 64),

@@ -89,10 +89,19 @@ REPETITION_THRESHOLD=${REPETITION_THRESHOLD:-0.97}
 # rrg-androidcontrol-gen-step-reward). Off by default -- validated against a 32B-class reader,
 # not the 8B READER_URL default above; point STEP_REWARD_READER_URL/_MODEL at a stronger reader
 # when enabling. Requires step_advantage_w>0 (already 1.0 below); main_ppo warns otherwise.
-STEP_REWARD_MODE=${STEP_REWARD_MODE:-mc}           # mc|gen
+STEP_REWARD_MODE=${STEP_REWARD_MODE:-mc}           # mc|gen|student
 GEN_MAX_TOKENS=${GEN_MAX_TOKENS:-64}
 GEN_N=${GEN_N:-8}
 GEN_TEMPERATURE=${GEN_TEMPERATURE:-0.8}
+# reward-v4 "student" mode (rrg-androidcontrol-reward-v4-*): a FIXED WEAK actor (Qwen3-VL-2B) sees
+# the real agent prompt, we prefill its reply with the policy's reasoning and score the continued
+# action vs gold (hard-zeroed on leakage). The reward endpoint IS the 2B student, so point
+# RRG_READER_URL/RRG_READER_MODEL at it (e.g. http://localhost:17289/v1 + Qwen3-VL-2B-Instruct) and
+# set TRAJ_REWARD_WEIGHT=0 (AndroidControl drops the macro channel). Requires step_advantage_w>0.
+STUDENT_MODEL=${STUDENT_MODEL:-}                    # blank = use READER_MODEL (reader IS the student)
+STUDENT_TAU=${STUDENT_TAU:-150.0}                   # click distance decay (validated flat 75-999)
+STUDENT_TEMPERATURE=${STUDENT_TEMPERATURE:-0.0}     # temp=0 greedy single sample (matches probe)
+STUDENT_MAX_TOKENS=${STUDENT_MAX_TOKENS:-64}
 # trajectory (macro) reward weight; 1.0 = current behavior. See rrg-androidcontrol-reward-
 # redesign for why this may want to go to 0 on AndroidControl once step_reward_mode=gen is
 # actually trained (dense per-step gold makes the macro channel a redundant/decoupled proxy).
@@ -187,6 +196,10 @@ python3 -m verl.trainer.main_ppo \
     env.rrg.gen_max_tokens=$GEN_MAX_TOKENS \
     env.rrg.gen_n=$GEN_N \
     env.rrg.gen_temperature=$GEN_TEMPERATURE \
+    env.rrg.student_model="$STUDENT_MODEL" \
+    env.rrg.student_tau=$STUDENT_TAU \
+    env.rrg.student_temperature=$STUDENT_TEMPERATURE \
+    env.rrg.student_max_tokens=$STUDENT_MAX_TOKENS \
     env.rrg.traj_reward_weight=$TRAJ_REWARD_WEIGHT \
     env.rrg.teacher_data_path=$TEACHER_DATA_PATH \
     env.rrg.teacher_seed_k=$TEACHER_SEED_K \

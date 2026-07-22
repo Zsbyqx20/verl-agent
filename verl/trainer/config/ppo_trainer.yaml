@@ -377,6 +377,11 @@ env:
     gen_max_tokens: 64         # reader max_tokens for one generated action
     gen_n: 8                   # samples per rollout-step, averaged into a mean-SSR score
     gen_temperature: 0.8       # sampling temp for gen_n>1 (gen_n=1 falls back to greedy/temp=0)
+    student_model: ""          # reward-v4 (student mode): override model name if student != reader
+    student_tau: 150.0         # click distance decay scale (validated flat plateau 75-999)
+    student_temperature: 0.0   # temp=0 = greedy single sample (matches offline probe)
+    student_max_tokens: 64     # max tokens for the continued action after prefill
+    student_max_image_long: 0  # 0 = full-res screenshot (matches validation); >0 caps long side
     system_prompt_file: null   # match the SFT system prompt (prompts/system_amex.txt)
     # Teacher-demo injection (EXPLORATION): seed the first teacher_seed_k slots of each group with a
     # verified teacher trajectory so the policy learns note-taking it can't produce on its own. TRAIN only.
