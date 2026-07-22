@@ -382,6 +382,8 @@ env:
     student_temperature: 0.0   # temp=0 = greedy single sample (matches offline probe)
     student_max_tokens: 64     # max tokens for the continued action after prefill
     student_max_image_long: 0  # 0 = full-res screenshot (matches validation); >0 caps long side
+    student_system_prompt_file: null  # student's OWN system prompt (validated AndroidControl agent
+                                      # prompt); DECOUPLED from system_prompt_file. null -> reuse it
     system_prompt_file: null   # match the SFT system prompt (prompts/system_amex.txt)
     # Teacher-demo injection (EXPLORATION): seed the first teacher_seed_k slots of each group with a
     # verified teacher trajectory so the policy learns note-taking it can't produce on its own. TRAIN only.

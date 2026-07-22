@@ -29,6 +29,10 @@ RRG_DATA_ROOT=${RRG_DATA_ROOT:-/data/liuguohong/workspace/ReverseReasoningGenera
 POLICY_MODEL=${POLICY_MODEL:-/data/liuguohong/workspace/rrpo/patched_policy}
 SYSTEM_PROMPT_FILE=${SYSTEM_PROMPT_FILE:-$RRG_DATA_ROOT/prompts/system_amex.txt}
 ANSWER_PROMPT_PATH=${ANSWER_PROMPT_PATH:-$RRG_DATA_ROOT/prompts/answer_actionrecovery.txt}
+# Student mode (reward-v4) uses its OWN system prompt, decoupled from the policy's SYSTEM_PROMPT_FILE:
+# the weak student MUST see the exact AndroidControl agent prompt it was validated with (byte-match),
+# while the AMEX-SFT policy keeps system_amex.txt to stay in-distribution. Ignored unless mode=student.
+STUDENT_SYSTEM_PROMPT_FILE=${STUDENT_SYSTEM_PROMPT_FILE:-$RRG_DATA_ROOT/prompts/system_androidcontrol_agent.txt}
 
 num_cpus_per_env_worker=0.1
 train_data_size=${TRAIN_DATA_SIZE:-16}   # distinct tasks sampled per batch (env_num); divisible by n_gpus=8
@@ -173,6 +177,7 @@ python3 -m verl.trainer.main_ppo \
     env.rrg.num_episodes=$num_episodes \
     env.rrg.val_num_episodes=$val_num_episodes \
     env.rrg.system_prompt_file=$SYSTEM_PROMPT_FILE \
+    env.rrg.student_system_prompt_file=$STUDENT_SYSTEM_PROMPT_FILE \
     env.rrg.answer_prompt_path=$ANSWER_PROMPT_PATH \
     env.rrg.concurrency=96 \
     env.rrg.answer_max_tokens=$ANSWER_MAX_TOKENS \

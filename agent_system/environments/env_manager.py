@@ -650,6 +650,8 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                 student_temperature=rcfg.get("student_temperature", 0.0),
                 student_max_tokens=rcfg.get("student_max_tokens", 64),
                 student_max_image_long=rcfg.get("student_max_image_long", 0))
+            # student_system_prompt_file is consumed by the env_manager (student prompt assembly),
+            # not the reward client -- loaded above into self.student_system_prompt.
         else:
             self.reward_client = None  # created lazily in set_self_judge_wg()
         self.coord_tol = rcfg.get("coord_tol", 8)
@@ -679,6 +681,16 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
         if spf and os.path.isfile(spf):
             with open(spf, encoding="utf-8") as f:
                 self.system_prompt = f.read().strip()
+
+        # Student mode (reward-v4) system prompt is DECOUPLED from the policy's system_prompt_file:
+        # the policy (AMEX-SFT) stays in-distribution with its SFT prompt, but the weak student must
+        # see the EXACT AndroidControl agent prompt it was validated with, or the reward diverges
+        # from every validated number. Falls back to the policy prompt only if unset (explicit).
+        self.student_system_prompt = self.system_prompt
+        sspf = rcfg.get("student_system_prompt_file", None)
+        if sspf and os.path.isfile(sspf):
+            with open(sspf, encoding="utf-8") as f:
+                self.student_system_prompt = f.read().strip()
 
         # global hard-distractor pool: every GT action string across the loaded episodes
         self.action_pool = sorted({action_str(fr["action"])
@@ -823,7 +835,7 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                 hist = self.history[i] if self.history else []
                 hist_str = "\n".join(f"Step {k + 1}: {r}" for k, r in enumerate(hist)) \
                     or "(none yet -- this is the first step)"
-                it["system"] = self.system_prompt
+                it["system"] = self.student_system_prompt
                 it["human"] = (
                     f"# Task goal\n{fr['goal']}\n\n"
                     f"# Your reasoning in previous steps\n{hist_str}\n\n"
