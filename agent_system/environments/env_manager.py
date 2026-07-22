@@ -644,7 +644,12 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
                 step_reward_mode=rcfg.get("step_reward_mode", "mc"),
                 gen_max_tokens=rcfg.get("gen_max_tokens", 64),
                 gen_n=rcfg.get("gen_n", 8),
-                gen_temperature=rcfg.get("gen_temperature", 0.8))
+                gen_temperature=rcfg.get("gen_temperature", 0.8),
+                student_model=rcfg.get("student_model", "") or "",
+                student_tau=rcfg.get("student_tau", 150.0),
+                student_temperature=rcfg.get("student_temperature", 0.0),
+                student_max_tokens=rcfg.get("student_max_tokens", 64),
+                student_max_image_long=rcfg.get("student_max_image_long", 0))
         else:
             self.reward_client = None  # created lazily in set_self_judge_wg()
         self.coord_tol = rcfg.get("coord_tol", 8)
@@ -811,6 +816,19 @@ class RRGEnvironmentManager(EnvironmentManagerBase):
         # seed episode_rewards[0] correctly.
         items = [{"goal": fr["goal"], "image": fr["image_path"], "action": fr["action"],
                   "reasoning": text_actions[i]} for i, fr in enumerate(frames)]
+        # student mode needs the real agent prompt (goal+history, NO gold action) so the
+        # weak student sees exactly what it saw during offline validation.
+        if getattr(self.reward_client, "step_reward_mode", "") == "student":
+            for i, (it, fr) in enumerate(zip(items, frames)):
+                hist = self.history[i] if self.history else []
+                hist_str = "\n".join(f"Step {k + 1}: {r}" for k, r in enumerate(hist)) \
+                    or "(none yet -- this is the first step)"
+                it["system"] = self.system_prompt
+                it["human"] = (
+                    f"# Task goal\n{fr['goal']}\n\n"
+                    f"# Your reasoning in previous steps\n{hist_str}\n\n"
+                    "<image>"
+                )
         if self._async_mc_eligible and self._step_count > 0 and hasattr(self.reward_client, "submit_score_step_margins"):
             self._pending_mc = self.reward_client.submit_score_step_margins(items, self.action_pool)
             rewards = np.zeros(len(items), dtype=np.float32)

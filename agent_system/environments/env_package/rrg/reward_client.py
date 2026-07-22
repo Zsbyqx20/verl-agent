@@ -228,6 +228,118 @@ def _build_gen_text(reasoning: Optional[str]) -> str:
     return (f"{rblock}Output the single next action now.")
 
 
+# --------------------------------------------------------------------------- #
+# reward-v4 "student" mode helpers (validated in src/androidcontrol_reward_residual_probe.py)
+# --------------------------------------------------------------------------- #
+# Unlike gen mode (goal WITHHELD, reward-side system prompt, open-gen), student mode reproduces
+# the offline probe exactly: a FIXED WEAK actor (2B) sees the REAL agent prompt (goal + own-notes
+# history) and we PREFILL its reply with "<think>{reasoning}</think><action>" then let it continue
+# the action. The reward is how well that continued action matches gold -- i.e. how much the
+# policy's blind reasoning helps a weak student ground. GiGPO group-norm supplies the baseline
+# (all rollouts at a step share screenshot+gold+history), so no none-subtraction is needed.
+STUDENT_TAU = 150.0  # validated; the tau sweep was flat over 75-999, 150 is mid-plateau
+
+# integer OR decimal coordinate, comma/space/x separated -- robust to "858, 947" / "(858.0,947.0)"
+_COORD_NUM_RE = r"(\d{1,4}(?:\.\d+)?)"
+
+# The AndroidControl agent DSL is KEYWORD-style: click(x=500, y=214), type(text='...'),
+# open_app(app_name='...'), swipe(direction='down'), system_button(button='back'). The gen-mode
+# parse_gen_action expects POSITIONAL args (its own STEP_GEN_SYSTEM prompt), so student mode needs
+# its own kwarg-tolerant parser -- a faithful port of androidcontrol_ssr_eval.parse_action_text +
+# normalize_parsed_action (the exact grammar reward-v4 was validated against). Emits the same dict
+# shape as parse_gen_action so score_gen_action scores it unchanged.
+_STUDENT_ACT_RE = re.compile(
+    r'\b(open_app|long_press|click|type|wait|swipe|system_button)\s*\(([^()]*)\)',
+    re.IGNORECASE | re.DOTALL)
+_STUDENT_KWARG_RE = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*")
+_STUDENT_DIRS = {"up", "down", "left", "right"}
+_STUDENT_BTNS = {"back", "home"}
+
+
+def _student_strip_kwarg(s: str) -> str:
+    return _STUDENT_KWARG_RE.sub("", s.strip(), count=1)
+
+
+def _student_unquote(s: str) -> str:
+    s = s.strip()
+    if len(s) >= 2 and s[0] in "\"'" and s[-1] == s[0]:
+        s = s[1:-1]
+    return s
+
+
+def parse_student_action(raw: str) -> Optional[dict]:
+    """Kwarg-tolerant parse of the AC agent DSL into the score_gen_action dict shape (first valid
+    match wins, matching ssr.parse_action_text). Returns None if unparseable/out-of-vocab."""
+    if not raw:
+        return None
+    for m in _STUDENT_ACT_RE.finditer(raw):
+        verb = m.group(1).lower()
+        arg = m.group(2).strip()
+        if verb in ("click", "long_press"):
+            parts = [_student_strip_kwarg(p) for p in arg.split(",") if p.strip()]
+            if len(parts) != 2:
+                continue
+            try:
+                return {"action": verb, "coordinate": [float(parts[0]), float(parts[1])]}
+            except ValueError:
+                continue
+        if verb == "type":
+            return {"action": "type", "text": _student_unquote(_student_strip_kwarg(arg))}
+        if verb == "wait":
+            return {"action": "wait"}
+        if verb == "swipe":
+            d = _student_unquote(_student_strip_kwarg(arg)).lower()
+            if d in _STUDENT_DIRS:
+                return {"action": "swipe", "direction": d}
+            continue
+        if verb == "system_button":
+            b = _student_unquote(_student_strip_kwarg(arg)).lower()
+            if b in _STUDENT_BTNS:
+                return {"action": "system_button", "button": b}
+            continue
+        if verb == "open_app":
+            return {"action": "open_app", "app": _student_unquote(_student_strip_kwarg(arg))}
+    return None
+
+
+def _student_leak(reasoning: Optional[str], gold: dict) -> bool:
+    """Hard-zero leakage veto (E5-style, generalized to all action types): does the reasoning
+    literally state the gold action's parameters? If so the weak student trivially succeeds and
+    the reward is measuring restatement, not reasoning -- veto it. Decimal-robust for coordinates."""
+    if not reasoning:
+        return False
+    r = reasoning.lower()
+    t = gold.get("action")
+    if t in ("click", "long_press"):
+        gx, gy = gold["coordinate"]
+        nums = [float(x) for x in re.findall(_COORD_NUM_RE, r)]
+        # leak iff BOTH gold coords appear (near-exact) among stated numbers
+        return (any(abs(n - gx) <= 2 for n in nums) and any(abs(n - gy) <= 2 for n in nums))
+    if t == "type":
+        txt = (gold.get("text") or "").strip().lower()
+        return len(txt) > 4 and txt in r
+    if t == "open_app":
+        app = (gold.get("app") or "").strip().lower()
+        return len(app) > 2 and (app in r) and ("open" in r or "app" in r)
+    if t == "swipe":
+        return f"swipe" in r and (gold.get("direction", "") in r)
+    if t == "system_button":
+        return "system_button" in r or (gold.get("button", "") in r and "button" in r)
+    return False
+
+
+def _build_student_messages(system: str, human: str, reasoning: Optional[str], durl: str) -> list:
+    """The exact 3-message shape validated in the probe: system = AC agent prompt, user = [image,
+    goal+history text with <image> stripped], assistant = prefill ending at the open <action> tag."""
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": durl}},
+            {"type": "text", "text": (human or "").replace("<image>", "").strip()}]},
+        {"role": "assistant", "content": f"<think>{reasoning or ''}</think><action>"},
+    ]
+
+
 # Empirically observed action-type confusion pairs: which OTHER action type a trained model
 # is most likely to mistakenly predict for a given gold type, from the AndroidControl SSR
 # eval's confusion matrix (base Qwen3-VL-4B, AMEX-SFT-4B-backfilled agent, and RL-step40-
@@ -354,6 +466,17 @@ def data_url(path_or_img, max_long: int) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def _raw_data_url(path: str) -> str:
+    """Byte-identical to androidcontrol_ssr_eval.image_to_data_url: send the ORIGINAL file bytes with
+    no decode/resize/re-encode. reward-v4 (student mode) was validated this way; round-tripping
+    through PIL shifts the vision encoder enough to move the click score by ~0.03."""
+    import mimetypes
+    with open(path, "rb") as f:
+        raw = f.read()
+    mime = mimetypes.guess_type(path)[0] or "image/png"
+    return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+
+
 # --------------------------------------------------------------------------- #
 # Reward client
 # --------------------------------------------------------------------------- #
@@ -363,7 +486,10 @@ class RRGRewardClient:
                  subtract_control: bool = False, api_key: str = "sk-dummy",
                  answer_prompt_path: Optional[str] = None,
                  step_reward_mode: str = "mc", gen_max_tokens: int = 64,
-                 gen_n: int = 8, gen_temperature: float = 0.8):
+                 gen_n: int = 8, gen_temperature: float = 0.8,
+                 student_model: str = "", student_tau: float = STUDENT_TAU,
+                 student_temperature: float = 0.0, student_max_tokens: int = 64,
+                 student_max_image_long: int = 0):
         self.base_url = base_url
         self.model = model_name
         self.max_image_long = max_image_long
@@ -394,6 +520,22 @@ class RRGRewardClient:
         self.gen_max_tokens = gen_max_tokens
         self.gen_n = max(1, int(gen_n))
         self.gen_temperature = float(gen_temperature)
+        #   "student" (reward-v4): a FIXED WEAK actor (2B) sees the real agent prompt (goal+history),
+        #         we prefill its reply with the policy's reasoning and let it continue the action
+        #         (temp=0, single sample). Score = SSR-style match vs gold (student_tau), HARD-ZEROED
+        #         on leakage (_student_leak). Validated offline (within-item Spearman 0.43 vs a 32B
+        #         gold-anchored judge, positive all action types). student_model may differ from the
+        #         reader model; for AndroidControl the reader endpoint IS the 2B student and the traj
+        #         channel is muted (traj_reward_weight=0). Same no-control rationale as gen mode.
+        self.student_model = student_model
+        self.student_tau = float(student_tau)
+        self.student_temperature = float(student_temperature)
+        self.student_max_tokens = int(student_max_tokens)
+        # reward-v4 was validated with the FULL-RES screenshot (ssr.image_to_data_url sends raw
+        # bytes, no resize). The 8B reader path downscales to max_image_long=768; the student must
+        # NOT, or it grounds on a shrunk image and the reward diverges from every validated number.
+        # 0 => no resize (full res, matches validation). >0 => cap long side (parity with mc/gen).
+        self.student_max_image_long = int(student_max_image_long)
         # Answer-assembly system prompt override (e.g. AndroidControl's blind
         # action-sequence-recovery framing instead of RRG's default info-retrieval one).
         # None (default) -> _assemble_answer falls back to answer_recovery.ANSWER_PROMPT,
@@ -508,6 +650,27 @@ class RRGRewardClient:
                   for ch in r.choices]
         return sum(scores) / len(scores) if scores else 0.0
 
+    async def _student_score(self, client, sem, durl, gold, img_wh, system, human, reasoning) -> float:
+        """reward-v4: fixed WEAK student sees the real agent prompt (goal+history), we PREFILL its
+        reply with the policy's reasoning and let it continue the action (temp=0, single sample via
+        continue_final_message). Score = SSR-style match vs gold (STUDENT_TAU), HARD-ZEROED if the
+        reasoning leaked the gold action's params. Reproduces src/androidcontrol_reward_residual_probe."""
+        if _student_leak(reasoning, gold):
+            return 0.0  # hard zero: reasoning restated the answer, reward would be measuring leakage
+        msgs = _build_student_messages(system, human, reasoning, durl)
+        async with sem:
+            r = await self._retry(lambda: client.chat.completions.create(
+                model=self.student_model or self.model, messages=msgs,
+                max_tokens=self.student_max_tokens, temperature=self.student_temperature,
+                extra_body={"add_generation_prompt": False, "continue_final_message": True}))
+        pred = parse_student_action("<action>" + (r.choices[0].message.content or ""))
+        s = score_gen_action(pred, gold, img_wh)
+        # score_gen_action uses the module COORD_TAU(=90); reward-v4 validated at STUDENT_TAU(=150).
+        # Rescale the click/long_press decay: exp(-d/90)->exp(-d/tau) == s**(90/tau) for s>0.
+        if gold.get("action") in ("click", "long_press") and s > 0 and self.student_tau != COORD_TAU:
+            s = s ** (COORD_TAU / self.student_tau)
+        return s
+
     async def _score_step_margins(self, items, action_pool):
         client, sem = self._client(), asyncio.Semaphore(self.concurrency)
         rng = random.Random(self.seed)
@@ -524,6 +687,32 @@ class RRGRewardClient:
                 durl = data_url(im, self.max_image_long)
                 jobs.append(self._gen_score(client, sem, durl, it["action"], im.size,
                                             it.get("reasoning") or None))
+            res = await asyncio.gather(*jobs, return_exceptions=True)
+            return [0.0 if isinstance(v, Exception) else float(v) for v in res]
+
+        if self.step_reward_mode == "student":
+            # reward-v4: weak-student blind-reasoning uplift, ONE temp=0 call per rollout. Needs the
+            # real agent prompt (system+human) so the student sees goal+history; env_manager threads
+            # those in. Same no-control rationale as gen: group-norm on the micro channel is the baseline.
+            jobs = []
+            for it in items:
+                # reward-v4 was validated by sending the RAW screenshot bytes (ssr.image_to_data_url:
+                # no decode, no resize, no PNG round-trip). Reproduce that exactly for a file path in
+                # full-res mode -- a PIL convert("RGB")+re-save shifts the vision encoder by a pixel
+                # or two and moves the click score. score_gen_action ignores img_wh (coords are
+                # already 0-1000), so (0,0) is fine. Only decode when we must resize or lack a path.
+                img = it["image"]
+                if isinstance(img, str) and self.student_max_image_long <= 0:
+                    durl = _raw_data_url(img)          # byte-identical to validation
+                    wh = (0, 0)
+                else:
+                    im = Image.open(img).convert("RGB") if isinstance(img, str) else img.convert("RGB")
+                    durl = data_url(im, self.student_max_image_long if self.student_max_image_long > 0
+                                    else max(im.size) + 1)
+                    wh = im.size
+                jobs.append(self._student_score(client, sem, durl, it["action"], wh,
+                                                it.get("system") or "", it.get("human") or "",
+                                                it.get("reasoning") or None))
             res = await asyncio.gather(*jobs, return_exceptions=True)
             return [0.0 if isinstance(v, Exception) else float(v) for v in res]
 
