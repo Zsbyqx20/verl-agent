@@ -266,7 +266,14 @@ class RRGTrajectoryRewardManager:
         results = [{"recall": 0.0, "correct": False, "answer": None,
                     "parse_error": "no gold/schema"} for _ in items]
         prefix_results = [None] * len(items)  # per-item score_prefix_recovery dict (step-credit mode)
-        if scorable:
+        # Macro-channel gate: when traj_reward_weight==0 the shaped reward is 0*w==0 regardless of
+        # recall, so the answer-recovery reader call is pure waste -- and on AndroidControl+student
+        # mode (reward-v4) we DELIBERATELY drop the macro channel (the answer-recovery proxy was
+        # found decoupled from action correctness). Skip the reader entirely then. EXCEPTION:
+        # answer_step_credit reuses score_prefix_recovery to feed the MICRO channel, so it must
+        # still run even at weight 0. Skipped trajectories keep recall 0.0 (honest: not computed).
+        macro_muted = (self.traj_reward_weight == 0.0) and not self.answer_step_credit
+        if scorable and not macro_muted:
             sc_items = [items[j] for j in scorable]
             if self.answer_step_credit:
                 # prefix-wise recovery: gives BOTH the macro recall (final prefix, reused below
